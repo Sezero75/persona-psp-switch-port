@@ -3,7 +3,7 @@
 | Contributor | Contribution |
 | --- | --- |
 | ATLUS and the original Persona development team | Original PlayStation Portable game, story, music and artwork |
-| This port's maintainer | Project direction, Switch hardware testing and feedback on gameplay, audio and opening-movie playback |
+| Sezero75 | Project direction, Switch hardware testing and feedback on gameplay, audio and opening-movie playback |
 | Jstar269 and the Nakagawa Recomp contributors | Static recompilation tooling, PSP runtime, renderer and media integration. [Pinned source](https://github.com/Jstar269/Nakagawa-Recomp/tree/2263985dd8882acbbf1a7313f3752979e7f88e2d) |
 | sal063 and the PSP Recompilation Project authors | Foundational recompiler and runtime used by Nakagawa. [Project](https://github.com/sal063/PSP-recompilation-project) |
 | Henrik Rydgård and the PPSSPP contributors | PSP runtime, graphics and VFPU work inherited through the upstream projects. [Project](https://github.com/hrydgard/ppsspp) |
