@@ -1,0 +1,1923 @@
+--- a/src/rt/ge.c
++++ b/src/rt/ge.c
+@@ -1217,13 +1217,17 @@
+     return (base + linear) ^ 0x2040u;
+ }
+ 
++static uint32_t active_depth_first, active_depth_end;
++static void update_depth_bounds(void) {
++    if (!ge_zbuf_guest_span_bounds(s_zbuf_guest_base, s_zbuf_guest_stride,
++                                   &active_depth_first, &active_depth_end))
++        active_depth_first = active_depth_end = 0;
++}
++
+ static int ge_zbuf_range_overlaps(uint32_t addr, uint32_t width) {
+     if (!s_zbuf_guest_valid || width == 0u) return 0;
+-    uint32_t surface_first, surface_end;
+-    if (!ge_zbuf_guest_span_bounds(s_zbuf_guest_base, s_zbuf_guest_stride,
+-                                   &surface_first, &surface_end)) return 0;
+     uint64_t access_end = (uint64_t)addr + width;
+-    return (uint64_t)addr < surface_end && surface_first < access_end;
++    return addr < active_depth_end && active_depth_first < access_end;
+ }
+ 
+ int ge_zbuf_materialize_current(void) {
+@@ -1274,6 +1278,7 @@
+         s_zbuf_guest_base = base;
+         s_zbuf_guest_stride = stride;
+         s_zbuf_guest_valid = 1;
++        update_depth_bounds();
+         s_zbuf_guest_dirty = 0;
+     }
+     s_zbuf_layout_accepted = 1;
+@@ -1294,6 +1299,7 @@
+     s_zbuf_guest_base = base;
+     s_zbuf_guest_stride = stride;
+     s_zbuf_guest_valid = 1;
++    update_depth_bounds();
+     s_zbuf_layout_accepted = 1;
+     ge_zbuf_note_write();
+ }
+@@ -1367,6 +1373,7 @@
+     if (s_zbuf_guest_base < 0x00200000u) s_zbuf_guest_base += SR_VRAM_CPU_BASE;
+     s_zbuf_guest_stride = state->zbw ? state->zbw : (state->fbw ? state->fbw : 512u);
+     s_zbuf_guest_valid = s_zbuf_guest_stride <= 512u;
++    update_depth_bounds();
+     s_zbuf_layout_accepted = 0;           /* restored without the layout check */
+     s_zbuf_guest_dirty = s_zbuf_guest_valid;
+     if (s_zbuf_guest_dirty) g_sr_vram_read_pending = 1;
+@@ -2523,6 +2530,7 @@
+ /* Read a whole decoded level through one host pointer when every byte texel_offset can
+  * address for it lies in one span ge_read_span accepts. Block-compressed formats keep the
+  * scalar path. */
++static size_t tex_host_bytes, indexed_source_bytes;
+ static void tex_decode_host_begin(const TexLevel *t) {
+     static const uint8_t bits_of[8] = {16, 16, 16, 32, 4, 8, 16, 32};
+     s_tex_host = NULL;
+@@ -2541,7 +2549,7 @@
+     }
+     if (last + 4u > 0x00200000u) return;
+     const uint8_t *host = ge_read_span(t->addr, (uint32_t)last + 4u);
+-    if (host) { s_tex_host = host; s_tex_host_addr = t->addr; }
++    if (host) { s_tex_host = host; s_tex_host_addr = t->addr; tex_host_bytes = (size_t)last + 4u; }
+ }
+ static void tex_decode_host_end(void) { s_tex_host = NULL; }
+ 
+@@ -2616,6 +2624,85 @@
+ static void sample_tex(int tu, int tv, int *r, int *g, int *b, int *a) {
+     TexLevel t = tex_level(0u);
+     sample_tex_level(&t, tu, tv, r, g, b, a);
++}
++
++/* For a software PRIM, indexed level-zero textures in ordinary RAM can be
++ * sampled through one checked view. PSP CLUT RAM and sampler registers stay
++ * constant for the duration of that command. */
++static const uint8_t *indexed_source;
++static uint32_t pack8888(int r, int g, int b, int a);
++static uint32_t indexed_palette[256];
++static uint32_t indexed_pitch;
++static void indexed_offsets(void);
++static void indexed_draw_begin(void) {
++    indexed_source = NULL;
++    if (s_gpu || !ge.tex_enable || ge.clear || (ge.tex_fmt != 4 && ge.tex_fmt != 5) ||
++        ge_tex_mip_active(&ge) || SR_PHYS(ge.tex_addr) < SR_RAM_BASE ||
++        ge.tex_w <= 0 || ge.tex_h <= 0 || ge.tex_w > 512 || ge.tex_h > 512) return;
++    TexLevel t = tex_level(0);
++    tex_decode_host_begin(&t);
++    indexed_source = s_tex_host;
++    indexed_source_bytes = tex_host_bytes;
++    s_tex_host = NULL;
++    if (!indexed_source) return;
++    indexed_pitch = t.bufw ? t.bufw : (uint32_t)t.w;
++    indexed_offsets();
++    unsigned count = ge.tex_fmt == 4 ? 16 : 256;
++    for (unsigned i = 0; i < count; ++i) {
++        int r, g, b, a;
++        clut_lookup(i, 0, &r, &g, &b, &a);
++        indexed_palette[i] = pack8888(r, g, b, a);
++    }
++}
++
++static uint32_t indexed_col[512], indexed_row[512];
++
++static void indexed_offsets(void) {
++    static unsigned old_pitch, old_bits, old_swizzle;
++    unsigned bits = ge.tex_fmt == 5 ? 8 : 4;
++    if (old_pitch == indexed_pitch && old_bits == bits && old_swizzle == (unsigned)ge.tex_swizzle) return;
++    old_pitch = indexed_pitch;
++    old_bits = bits;
++    old_swizzle = ge.tex_swizzle;
++    /* The X and Y terms in both the linear and swizzled byte address are additive. */
++    for (unsigned i = 0; i < 512; ++i) {
++        indexed_col[i] = texel_offset(indexed_pitch, i, 0, bits);
++        indexed_row[i] = texel_offset(indexed_pitch, 0, i, bits);
++    }
++}
++
++static inline uint32_t indexed_fetch(unsigned u, unsigned v) {
++    unsigned byte = indexed_source[indexed_row[v] + indexed_col[u]];
++    return indexed_palette[ge.tex_fmt == 5 ? byte : (byte >> ((u & 1) * 4)) & 15];
++}
++
++/* Two byte lanes in parallel; the largest weighted sum per lane is 255*256. */
++static inline uint32_t filter_lanes(uint32_t a, uint32_t b, uint32_t c, uint32_t d,
++                                    unsigned fx, unsigned fy) {
++    const uint32_t lanes = 0x00ff00ff;
++    uint32_t top = (a & lanes) * (16 - fx) + (b & lanes) * fx;
++    uint32_t bottom = (c & lanes) * (16 - fx) + (d & lanes) * fx;
++    return ((top * (16 - fy) + bottom * fy) >> 8) & lanes;
++}
++
++static inline uint32_t sample_indexed(float u, float v, int linear) {
++    if (linear) { u -= 0.5f; v -= 0.5f; }
++    int x = (int)floorf(u), y = (int)floorf(v);
++    int clamp_x = ge.tex_wrap & 1, clamp_y = (ge.tex_wrap >> 8) & 1;
++    unsigned x0 = tex_coord(x, ge.tex_w, clamp_x), y0 = tex_coord(y, ge.tex_h, clamp_y);
++    uint32_t a = indexed_fetch(x0, y0);
++    if (!linear) return a;
++    unsigned fx = (unsigned)((u - (float)x) * 16), fy = (unsigned)((v - (float)y) * 16);
++    if (fx > 15) fx = 15;
++    if (fy > 15) fy = 15;
++    if (!(fx | fy)) return a;
++    unsigned x1 = fx ? tex_coord(x+1, ge.tex_w, clamp_x) : x0;
++    unsigned y1 = fy ? tex_coord(y+1, ge.tex_h, clamp_y) : y0;
++    uint32_t b = fx ? indexed_fetch(x1,y0) : a;
++    uint32_t c = fy ? indexed_fetch(x0,y1) : a;
++    uint32_t d = fx && fy ? indexed_fetch(x1,y1) : (fy ? c : b);
++    return filter_lanes(a,b,c,d,fx,fy) |
++        (filter_lanes(a>>8,b>>8,c>>8,d>>8,fx,fy) << 8);
+ }
+ 
+ /* Squared texel footprint of one pixel step: the larger squared length of the level-0
+@@ -2680,6 +2767,10 @@
+     if (fy > 15) fy = 15;
+     int r0,g0,b0,a0, r1,g1,b1,a1, r2,g2,b2,a2, r3,g3,b3,a3;
+     sample_tex_level(&t, u0,   v0,   &r0,&g0,&b0,&a0);
++    if (!(fx | fy)) {
++        *r = r0; *g = g0; *b = b0; *a = a0;
++        return;
++    }
+     sample_tex_level(&t, u0+1, v0,   &r1,&g1,&b1,&a1);
+     sample_tex_level(&t, u0,   v0+1, &r2,&g2,&b2,&a2);
+     sample_tex_level(&t, u0+1, v0+1, &r3,&g3,&b3,&a3);
+@@ -2700,6 +2791,13 @@
+     static int nobil = -1; if (nobil < 0) nobil = getenv("SR_NOBILINEAR") ? 1 : 0;
+     int filter_linear = minifying ? (ge.tex_filter & 1) : ((ge.tex_filter >> 8) & 1);
+     int use_linear = !nobil && filter_linear;
++    if (indexed_source && level == 0 && frac == 0 && s_stat_on <= 0) {
++        uint32_t rgba = sample_indexed(fu, fv_coord, use_linear);
++        unpack_color(rgba, 3, r, g, b, a);
++        ++g_tex_samples;
++        if (rgba & 0x00ffffffu) ++g_tex_nonzero;
++        return;
++    }
+     sample_level_f(level, fu, fv_coord, use_linear, r, g, b, a);
+     if (frac <= 0) return;
+     int r1, g1, b1, a1;
+@@ -3485,6 +3583,42 @@
+     compose_px_rgba(x,y,r,g,b,a,a);
+ }
+ 
++static uint32_t *direct_rgba_target(void) {
++    if (s_wing || (ge.fbfmt & 3) != 3 || s_stat_on > 0) return NULL;
++    uint32_t stride = ge.fbw ? ge.fbw : 512;
++    if (stride > 2048) return NULL;
++    uint32_t addr = ge_fb_addr();
++    if (addr & 3) return NULL;
++    return (uint32_t *)ge_fb_host(addr, ((271 * stride) + raster_columns()) * 4);
++}
++
++/* On an RGBA8888 target alpha holds the old stencil value when its test is
++ * disabled. Keep the PSP's separately rounded source and destination products. */
++static inline unsigned store_rgba_pixel(uint32_t *dst, int x, int y, int r, int g, int b, int a) {
++    uint32_t old = *dst;
++    if (ge.blend_enable && !a) {
++        r = old & 255; g = (old >> 8) & 255; b = (old >> 16) & 255;
++    } else if (ge.blend_enable && a != 255) {
++        int other = 255 - a;
++        r = blend_mul(r, a) + blend_mul((int)(old & 255), other);
++        g = blend_mul(g, a) + blend_mul((int)((old >> 8) & 255), other);
++        b = blend_mul(b, a) + blend_mul((int)((old >> 16) & 255), other);
++    }
++    int d = ge.dither_enable ? ge.dith[y & 3][x & 3] : 0;
++    r = clamp8(r + d); g = clamp8(g + d); b = clamp8(b + d);
++    *dst = (old & 0xff000000u) | (uint32_t)r | ((uint32_t)g << 8) | ((uint32_t)b << 16);
++    return (r | g | b) != 0;
++}
++
++static inline void blend_rgba_pixel(uint32_t *dst, int x, int y, int r, int g, int b, int a) {
++    unsigned nonblack = store_rgba_pixel(dst, x, y, r, g, b, a);
++    extern unsigned long g_list_writes, g_list_nonblack;
++    ++g_list_writes;
++    g_list_nonblack += nonblack;
++    ++g_ge_pixels;
++    if (s_in3d) ++s_stat.px3d; else ++s_stat.px2d;
++}
++
+ /* Ordered PSP stencil/depth commit. Alpha/color tests and fog have already run in shade(). */
+ static void put_px_rgba_tested(int x, int y, uint16_t pz, int use_z,
+                                int r, int g, int b, int src_a) {
+@@ -3557,11 +3691,13 @@
+ }
+ 
+ /* Programmable alpha test (ALPHATEST 0xDB: func | ref<<8 | mask<<16). */
+-static int alpha_test(int a) {
+-    if (!ge.atest_enable) return 1;
++static int alpha_test_enabled(void) {
++    if (!ge.atest_enable) return 0;
+     static int noatest = -1;
+     if (noatest < 0) noatest = getenv("SR_NOATEST") ? 1 : 0;
+-    if (noatest) return 1;
++    return !noatest;
++}
++static int alpha_value_passes(int a) {
+     int mask = (int)((ge.atest >> 16) & 0xFF);
+     int ref  = (int)((ge.atest >> 8) & 0xFF) & mask;
+     int av   = a & mask;
+@@ -3577,6 +3713,10 @@
+         case 7: pass = (av >= ref); break;
+         default: pass = 1;
+     }
++    return pass;
++}
++static int alpha_test(int a) {
++    int pass = !alpha_test_enabled() || alpha_value_passes(a);
+     if (!pass) s_stat.afail++;
+     return pass;
+ }
+@@ -4036,6 +4176,173 @@
+ 
+ /* One triangle into the current target, or, during a wing pass (s_wing), into that wing
+  * canvas: a host-only draw, so it charges no GE time and leaves guest depth alone. */
++/* Large indexed background triangles recur across display flips. Reuse their result
++ * only when the source bytes, palette, draw parameters and existing pixels match.
++ * The target is validated by direct_rgba_target before each lookup. */
++typedef struct {
++    Vtx a, b, c;
++    int x, y, width, height, linear;
++    uint32_t fmt, pitch, wrap, tw, th, swizzle;
++    uint32_t blend, dither, atest, atest_on, ctest, ctest_on, cref, cmask;
++    int8_t matrix[4][4];
++} LayerKey;
++
++enum { LayerSlots = 12 };
++typedef struct {
++    LayerKey key;
++    uint32_t palette[256];
++    uint8_t *bytes;
++    size_t capacity, texture_size;
++    uint64_t age;
++    unsigned long writes, nonblack, afail;
++} LayerEntry;
++static LayerEntry layers[LayerSlots];
++static uint64_t layer_clock;
++extern unsigned long g_list_writes, g_list_nonblack;
++
++static int layer_rows(uint8_t *saved, uint32_t *fb, unsigned stride, int width, int height, int op) {
++    const size_t bytes = (size_t)width * sizeof(*fb);
++    for (int y = 0; y < height; ++y, saved += bytes, fb += stride) {
++        if (op == 0) { if (memcmp(saved, fb, bytes)) return 0; }
++        else if (op == 1) memcpy(saved, fb, bytes);
++        else memcpy(fb, saved, bytes);
++    }
++    return 1;
++}
++
++static LayerEntry *layer_begin(const LayerKey *key, uint32_t *fb, unsigned stride, int *restored) {
++    LayerEntry *slot = &layers[0];
++    size_t pixels = (size_t)key->width * key->height * sizeof(*fb);
++    size_t texbytes = indexed_source_bytes;
++    size_t palette_bytes = (ge.tex_fmt == 4 ? 16u : 256u) * sizeof(uint32_t);
++    if (!texbytes || texbytes > 264192 || key->width > 480 || key->height > 272 ||
++        stride < (unsigned)(key->x + key->width)) return NULL;
++    for (int i = 0; i < LayerSlots; ++i) {
++        LayerEntry *e = &layers[i];
++        if (e->age < slot->age) slot = e;
++        if (!e->age || e->texture_size != texbytes || memcmp(&e->key, key, sizeof(*key))) continue;
++        if (memcmp(e->palette, indexed_palette, palette_bytes) ||
++            memcmp(e->bytes, indexed_source, texbytes)) continue;
++        slot = e;
++        if (layer_rows(e->bytes + texbytes, fb, stride, key->width, key->height, 0)) {
++            layer_rows(e->bytes + texbytes + pixels, fb, stride, key->width, key->height, 2);
++            e->age = ++layer_clock;
++            g_ge_pixels += e->writes;
++            s_stat.px2d += e->writes;
++            g_list_writes += e->writes;
++            g_list_nonblack += e->nonblack;
++            s_stat.afail += e->afail;
++            *restored = 1;
++            return NULL;
++        }
++        break;
++    }
++    size_t needed = texbytes + pixels * 2;
++    if (slot->capacity < needed) {
++        uint8_t *storage = realloc(slot->bytes, needed);
++        if (!storage) return NULL;
++        slot->bytes = storage;
++        slot->capacity = needed;
++    }
++    slot->key = *key;
++    slot->texture_size = texbytes;
++    memcpy(slot->palette, indexed_palette, palette_bytes);
++    memcpy(slot->bytes, indexed_source, texbytes);
++    layer_rows(slot->bytes + texbytes, fb, stride, key->width, key->height, 1);
++    slot->writes = g_list_writes;
++    slot->nonblack = g_list_nonblack;
++    slot->afail = s_stat.afail;
++    slot->age = ++layer_clock;
++    return slot;
++}
++
++static void layer_finish(LayerEntry *e, uint32_t *fb, unsigned stride) {
++    size_t pixels = (size_t)e->key.width * e->key.height * sizeof(*fb);
++    layer_rows(e->bytes + e->texture_size + pixels, fb, stride, e->key.width, e->key.height, 1);
++    e->writes = g_list_writes - e->writes;
++    e->nonblack = g_list_nonblack - e->nonblack;
++    e->afail = s_stat.afail - e->afail;
++}
++
++
++typedef struct {
++    int left, right, top, bottom, linear, test_alpha;
++    uint32_t *target;
++    unsigned stride;
++    float inv, u, v, du0, du1, dv0, dv1;
++    int r, g, b, a;
++    long long origin[3], down[3], across[3], bias[3];
++    struct { unsigned writes, nonblack, rejected; } counts[3];
++} IndexedDraw;
++
++static void draw_indexed_rows(void *argument, unsigned lane, unsigned lanes) {
++    IndexedDraw *job = argument;
++    unsigned writes = 0, nonblack = 0, rejected = 0;
++    for (int y = job->top + (int)lane; y <= job->bottom; y += (int)lanes) {
++        int row = y - job->top;
++        long long e0 = job->origin[0] + job->down[0]*row;
++        long long e1 = job->origin[1] + job->down[1]*row;
++        long long e2 = job->origin[2] + job->down[2]*row;
++        uint32_t *output = job->target + y * job->stride;
++        for (int x = job->left; x <= job->right; ++x,
++             e0 += job->across[0], e1 += job->across[1], e2 += job->across[2]) {
++            if (e0+job->bias[0] < 0 || e1+job->bias[1] < 0 || e2+job->bias[2] < 0) continue;
++            float w0 = (float)e1 * job->inv, w1 = (float)e2 * job->inv;
++            float u = job->u + w0*job->du0 + w1*job->du1;
++            float v = job->v + w0*job->dv0 + w1*job->dv1;
++            uint32_t pixel = sample_indexed(u, v, job->linear);
++            int a = ((int)(pixel >> 24) * job->a) >> 8;
++            if (job->test_alpha && !alpha_value_passes(a)) { ++rejected; continue; }
++            int r = ((int)(pixel & 255) * job->r) >> 8;
++            int g = ((int)((pixel >> 8) & 255) * job->g) >> 8;
++            int b = ((int)((pixel >> 16) & 255) * job->b) >> 8;
++            if (!color_test(r,g,b)) continue;
++            nonblack += store_rgba_pixel(&output[x],x,y,r,g,b,a);
++            ++writes;
++        }
++    }
++    job->counts[lane].writes = writes;
++    job->counts[lane].nonblack = nonblack;
++    job->counts[lane].rejected = rejected;
++}
++
++static int movie_strip_mapping(const Vtx *a, const Vtx *b, const Vtx *c) {
++    const Vtx *corners[] = {a, b, c};
++    float left = fminf(a->x, fminf(b->x, c->x));
++    float right = fmaxf(a->x, fmaxf(b->x, c->x));
++    if (left < 0 || right > 480 || left != floorf(left) ||
++        (right - left != 32 && right - left != 64)) return 0;
++    for (unsigned i = 0; i < 3; ++i) {
++        const Vtx *v = corners[i];
++        if ((v->x != left && v->x != right) || (v->y != 0 && v->y != 272) ||
++            v->u != v->x || v->v != v->y) return 0;
++    }
++    return 1;
++}
++/* A decoded movie texture is already RGBA8888. The GE presents it with unit
++ * texture coordinates and white/zero fixed blend factors. Keep the original
++ * coverage and interpolation, including the 1/16-pixel bilinear weights. */
++static inline uint32_t movie_texel(const uint32_t *p, int u, int v) {
++    u = tex_coord(u, ge.tex_w, ge.tex_wrap & 1);
++    v = tex_coord(v, ge.tex_h, (ge.tex_wrap >> 8) & 1);
++    return p[v * ge.tex_bufw + u];
++}
++static inline uint32_t movie_sample(const uint32_t *row, const uint32_t *texture,
++                                    int x, int y, float u, float v, int linear) {
++    if (!linear || (u >= x + 0.5f && v >= y + 0.5f)) return row[x];
++    /* The guarded unit mapping can round just below the exact pixel centre.
++     * Use the same tap weights as the general sampler at those coordinates. */
++    float su = u - 0.5f, sv = v - 0.5f;
++    int left = (int)floorf(su), top = (int)floorf(sv);
++    unsigned fx = (unsigned)((su-left)*16), fy = (unsigned)((sv-top)*16);
++    if (fx > 15) fx = 15;
++    if (fy > 15) fy = 15;
++    uint32_t a = movie_texel(texture,left,top), b = fx ? movie_texel(texture,left+1,top) : a;
++    uint32_t c = fy ? movie_texel(texture,left,top+1) : a;
++    uint32_t d = fx && fy ? movie_texel(texture,left+1,top+1) : fy ? c : b;
++    return filter_lanes(a,b,c,d,fx,fy) | (filter_lanes(a>>8,b>>8,c>>8,d>>8,fx,fy)<<8);
++}
++
+ static void raster_tri(const Vtx *A, const Vtx *B, const Vtx *C, int persp) {
+     if (vtx_nonfinite(A, B, C)) return;
+     const int wing = s_wing != NULL;
+@@ -4156,6 +4463,105 @@
+     long long e1r = dx1*(py0-by)  - dy1*(px0-bx);
+     long long e2r = dx2*(py0-cyy) - dy2*(px0-cxx);
+ 
++    who_init();
++    uint32_t *direct = NULL;
++    if (!use_z && !ge.clear && !ge.stencil_enable && !ge.logic_op_enable &&
++        !ge.mask_rgb && !ge.mask_alpha && (!ge.blend_enable || ge.blend_mode == 0x32) &&
++        s_twin_mode == 0 && !s_raster_mutant && s_who_x < 0)
++        direct = direct_rgba_target();
++    const int mip = textured && ge_tex_mip_active(&ge);
++    const uint32_t row_stride = ge.fbw ? ge.fbw : 512;
++    if (!persp && textured && ge.tex_fmt == 3 && !ge.tex_swizzle && !mip &&
++        ge.tex_func == 0x100 && ge.blend_enable && ge.blend_mode == 0xaa &&
++        ge.blend_fixa == 0xffffff && ge.blend_fixb == 0 && !ge.atest_enable &&
++        !ge.color_test_enable && !ge.mask_alpha && !ge.mask_rgb && !use_z &&
++        !ge.stencil_enable && !ge.logic_op_enable && !s_gpu && !s_wing && !s_raster_mutant &&
++        s_who_x < 0 && s_twin_mode == 0 && ge.tex_w == 512 && ge.tex_h == 512 &&
++        ge.tex_bufw == 512 && !(ge.tex_addr & 3) && maxx < 480 && maxy < 272 &&
++        ge.vtype == 0x800102 && C->r == 255 && C->g == 255 && C->b == 255 &&
++        (!gouraud || (!ir_ac && !ir_bc && !ig_ac && !ig_bc && !ib_ac && !ib_bc)) &&
++        movie_strip_mapping(A,B,C) &&
++        (ge.tex_filter & 0x101) == 0x101) {
++        const uint32_t *texture = (const uint32_t *)ge_ram_span(ge.tex_addr, 512*512*4);
++        uint32_t *target = direct_rgba_target();
++        if (target && texture) {
++            static int linear = -1;
++            if (linear < 0) linear = !getenv("SR_NOBILINEAR");
++            unsigned writes = 0, nonblack = 0;
++            for (int y=miny; y<=maxy; ++y,e0r+=dx0*16,e1r+=dx1*16,e2r+=dx2*16) {
++                long long e0=e0r, e1=e1r, e2=e2r;
++                uint32_t *dst = target + y*row_stride;
++                const uint32_t *row = texture + y*512;
++                for (int x=minx; x<=maxx; ++x,e0-=dy0*16,e1-=dy1*16,e2-=dy2*16) {
++                    if (e0+bias0 < 0 || e1+bias1 < 0 || e2+bias2 < 0) continue;
++                    float w0f=(float)e1*inv, w1f=(float)e2*inv;
++                    AT_PIX(iu,u); AT_PIX(iv,v);
++                    uint32_t pixel = movie_sample(row,texture,x,y,iu,iv,linear);
++                    int d = ge.dither_enable ? ge.dith[y&3][x&3] : 0;
++                    int r=clamp8((int)(pixel&255)+d), g=clamp8((int)((pixel>>8)&255)+d);
++                    int b=clamp8((int)((pixel>>16)&255)+d);
++                    dst[x]=(dst[x]&0xff000000u) | r | ((uint32_t)g<<8) | ((uint32_t)b<<16);
++                    nonblack += (r|g|b)!=0;
++                    ++writes;
++                }
++            }
++            g_list_writes+=writes; g_ge_pixels+=writes; s_stat.px2d+=writes; g_list_nonblack+=nonblack;
++            return;
++        }
++    }
++
++    if (direct && !persp && indexed_source && !mip && ge.tex_func == 0x100 &&
++        (!gouraud || (!ir_ac && !ir_bc && !ig_ac && !ig_bc &&
++                      !ib_ac && !ib_bc && !ia_ac && !ia_bc))) {
++        float rho = tex_footprint_rho2(w0_dx*iu_ac + w1_dx*iu_bc,
++                                       w0_dy*iu_ac + w1_dy*iu_bc,
++                                       w0_dx*iv_ac + w1_dx*iv_bc,
++                                       w0_dy*iv_ac + w1_dy*iv_bc);
++        static int bilinear_allowed = -1;
++        if (bilinear_allowed < 0) bilinear_allowed = !getenv("SR_NOBILINEAR");
++        int linear = bilinear_allowed && ((ge.tex_filter >> (rho > 1.0f ? 0 : 8)) & 1);
++        LayerEntry *layer = NULL;
++        uint32_t *origin = direct + miny * row_stride + minx;
++        int width = maxx-minx+1, height = maxy-miny+1;
++        if (width * height >= 65536) {
++            LayerKey key = {
++                .a=*A, .b=*B, .c=*C, .x=minx, .y=miny, .width=width, .height=height, .linear=linear,
++                .fmt=ge.tex_fmt, .pitch=indexed_pitch, .wrap=ge.tex_wrap, .tw=ge.tex_w, .th=ge.tex_h,
++                .swizzle=ge.tex_swizzle, .blend=ge.blend_enable, .dither=ge.dither_enable,
++                .atest=ge.atest, .atest_on=ge.atest_enable, .ctest=ge.color_test, .ctest_on=ge.color_test_enable,
++                .cref=ge.color_ref, .cmask=ge.color_test_mask
++            };
++            memcpy(key.matrix, ge.dith, sizeof(key.matrix));
++            int restored = 0;
++            layer = layer_begin(&key, origin, row_stride, &restored);
++            if (restored) return;
++        }
++        IndexedDraw job = {
++            .left=minx, .right=maxx, .top=miny, .bottom=maxy, .linear=linear, .test_alpha=alpha_test_enabled(),
++            .target=direct, .stride=row_stride, .inv=inv, .u=VC->u, .v=VC->v,
++            .du0=iu_ac, .du1=iu_bc, .dv0=iv_ac, .dv1=iv_bc,
++            .r=C->r+1, .g=C->g+1, .b=C->b+1, .a=C->a+1,
++            .origin={e0r,e1r,e2r}, .down={dx0*16,dx1*16,dx2*16},
++            .across={-dy0*16,-dy1*16,-dy2*16}, .bias={bias0,bias1,bias2}
++        };
++        unsigned lanes = 1;
++#if defined(__SWITCH__) || defined(SR_TEST_RENDER_WORKERS)
++        extern unsigned nx_render_stripes(void (*draw)(void *,unsigned,unsigned), void *argument);
++        if (width*height >= 6144 && height >= 6 && row_stride >= (unsigned)(maxx+1))
++            lanes = nx_render_stripes(draw_indexed_rows, &job);
++        else
++#endif
++            draw_indexed_rows(&job, 0, 1);
++        for (unsigned i = 0; i < lanes; ++i) {
++            g_list_writes += job.counts[i].writes;
++            g_ge_pixels += job.counts[i].writes;
++            s_stat.px2d += job.counts[i].writes;
++            g_list_nonblack += job.counts[i].nonblack;
++            s_stat.afail += job.counts[i].rejected;
++        }
++        if (layer) layer_finish(layer, origin, row_stride);
++        return;
++    }
+     for (int y=miny; y<=maxy; y++, e0r+=dx0*16, e1r+=dx1*16, e2r+=dx2*16) {
+         long long e0=e0r, e1=e1r, e2=e2r;
+         int span_x = -1, span_ref = 0;   /* raster_tri_lod_span, per row */
+@@ -4196,10 +4602,12 @@
+             float rho2 = 0.0f, lod_q = irw;
+             int auto16 = 0;
+             if (textured) {
+-                long long d = (long long)(span_ref - x);
+-                float rw0 = (float)(e1 - dy1 * 16 * d) * inv, rw1 = (float)(e2 - dy2 * 16 * d) * inv;
+-                lod_q = VC->rw + rw0 * irw_ac + rw1 * irw_bc;
+-                auto16 = lod_rho16 - ge_lod_log16(lod_q);
++                if (mip) {
++                    long long d = (long long)(span_ref - x);
++                    float rw0 = (float)(e1 - dy1 * 16 * d) * inv, rw1 = (float)(e2 - dy2 * 16 * d) * inv;
++                    lod_q = VC->rw + rw0 * irw_ac + rw1 * irw_bc;
++                    auto16 = lod_rho16 - ge_lod_log16(lod_q);
++                }
+                 AT_PIX(iu, u); AT_PIX(iv, v);
+                 float iu_dx = w0_dx * iu_ac + w1_dx * iu_bc;
+                 float iv_dx = w0_dx * iv_ac + w1_dx * iv_bc;
+@@ -4227,6 +4635,10 @@
+ 
+             int sr,sg,sb,sa;
+             if (!shade(u,fv,rho2,auto16,lod_q,fog,r,g,b,a,&sr,&sg,&sb,&sa)) continue;
++            if (direct) {
++                blend_rgba_pixel(direct + y * row_stride + x, x, y, sr, sg, sb, sa);
++                continue;
++            }
+ 
+             /* SR_PIXWHO=x,y: log every triangle that writes the chosen pixel — identifies
+              * which draw owns a misrendered region without guessing from geometry. */
+@@ -5493,6 +5905,37 @@
+         }
+         int wc = (ge.clear_mode & 0x100) != 0, wa = (ge.clear_mode & 0x200) != 0;
+         if (!wc && !wa) return;
++        if (wc && !s_raster_mutant && !s_gpu && !wing && s_stat_on <= 0 &&
++            (s_twin_mode == 0 || (s_twin_mode < 0 && !ge_twin_decide()))) {
++            uint32_t *target = direct_rgba_target();
++            if (target) {
++                int left = xa < ge.scis_x1 ? ge.scis_x1 : xa;
++                int top = ya < ge.scis_y1 ? ge.scis_y1 : ya;
++                int right = xb > ge.scis_x2 + 1 ? ge.scis_x2 + 1 : xb;
++                int bottom = yb > ge.scis_y2 + 1 ? ge.scis_y2 + 1 : yb;
++                if (left < 0) left = 0;
++                if (top < 0) top = 0;
++                if (right > raster_columns()) right = raster_columns();
++                if (bottom > 272) bottom = 272;
++                if (right <= left || bottom <= top) return;
++                uint32_t tile[4][4], mask = fb_write_mask_native() | (wa ? 0u : 0xff000000u);
++                for (int j = 0; j < 4; ++j) for (int i = 0; i < 4; ++i) {
++                    int d = ge.dither_enable ? ge.dith[j][i] : 0;
++                    tile[j][i] = pack8888(clamp8(p1->r+d), clamp8(p1->g+d),
++                                          clamp8(p1->b+d), p1->a) & ~mask;
++                }
++                uint32_t stride = ge.fbw ? ge.fbw : 512;
++                for (int y = top; y < bottom; ++y) {
++                    uint32_t *row = target + y * stride;
++                    const uint32_t *pattern = tile[y & 3];
++                    if (mask) for (int x = left; x < right; ++x)
++                        row[x] = (row[x] & mask) | pattern[x & 3];
++                    else for (int x = left; x < right; ++x) row[x] = pattern[x & 3];
++                }
++                g_ge_pixels += (unsigned long)(right-left) * (bottom-top);
++                return;
++            }
++        }
+         /* Clear mode still dithers and still honours the pixel masks (PSP-GE-RASTER-001
+          * clr-ca-dth565, clr-ca-dth8888, clr-ca-msk); only an unmasked, undithered full
+          * clear writes one constant value. */
+@@ -5555,9 +5998,15 @@
+                 ge.scis_x1, ge.scis_y1, ge.scis_x2, ge.scis_y2);
+     }
+ 
+-    for (int y = ya; y < yb; y++) {
++    int left = wing ? s_wing_x0 : ge.scis_x1;
++    int right = wing ? s_wing_x1 : ge.scis_x2;
++    if (!wing && right >= raster_columns()) right = raster_columns() - 1;
++    if (!wing && left < 0) left = 0;
++    int top = ge.scis_y1 < 0 ? 0 : ge.scis_y1;
++    int bottom = ge.scis_y2 > 271 ? 271 : ge.scis_y2;
++    for (int y = ya < top ? top : ya; y < yb && y <= bottom; y++) {
+         float fv = v_start + (float)(y - ya) * v_dir;
+-        for (int x = xa; x < xb; x++) {
++        for (int x = xa < left ? left : xa; x < xb && x <= right; x++) {
+             float u = u_start + (float)(x - xa) * u_dir;
+             int r, g, b, a;
+             if (!shade(u, fv, rho2, spr_auto16, sq, fog, p1->r, p1->g, p1->b, p1->a, &r, &g, &b, &a)) continue;
+@@ -7587,7 +8036,9 @@
+     s_primitive_profile_through = vf.through;
+     s_primitive_profile_counting = s_primitive_profile;
+     if (vf.through) {
++        indexed_draw_begin();
+         draw_prim_through(&c);
++        indexed_source = NULL;
+         return;
+     }
+ 
+@@ -7597,6 +8048,7 @@
+     s_primitive_profile_counting = 0;
+     primitive_profile_clear_pending();
+     int rt = draw_prim_trace_transform(&c);
++    indexed_draw_begin();
+ 
+     s_primitive_profile_counting = s_primitive_profile;
+     if (type == 0) {           /* points */
+@@ -7611,6 +8063,7 @@
+     } else if (type == 6) {
+         draw_prim_xform_sprites(&c);
+     }
++    indexed_source = NULL;
+     s_primitive_profile_counting = 0;
+     primitive_profile_clear_pending();
+ }
+@@ -7845,7 +8298,13 @@
+     return next;
+ }
+ 
++#ifdef __SWITCH__
++uint64_t nx_ge_list_ns;
++#endif
+ uint32_t ge_run_list(uint32_t addr, int resume) {
++#ifdef __SWITCH__
++    uint64_t nx_list_start = SDL_GetTicksNS();
++#endif
+     uint64_t perf_started = sr_perf_now_ns();
+     if (!resume) s_ge_finish_id = 0u;   /* a new list has run no FINISH yet */
+     ge_cpu_profile_configure();
+@@ -7917,6 +8376,9 @@
+         sr_perf_ge_cpu_phase(transform_delta, primitive_delta);
+     }
+     s_ge_ms_acc += wall_ms() - t0;
++#ifdef __SWITCH__
++    nx_ge_list_ns += SDL_GetTicksNS() - nx_list_start;
++#endif
+     if (s_cpu_profile) {
+         uint64_t total = SDL_GetTicksNS() - profile_started;
+         uint64_t nested_after = 0;
+@@ -9134,3 +9596,4 @@
+     return !ge_vram_cli_bad_read;
+ }
+ #endif /* SR_GE_VRAM_DECODER_CLI */
++
+--- a/src/rt/hle_audio.c
++++ b/src/rt/hle_audio.c
+@@ -232,7 +232,13 @@
+ extern void sr_audio_push_silence(int ch, int nframes);
+ 
+ /* One display period in mixer frames, rounded up (736). */
++#ifdef __SWITCH__
++extern unsigned nx_audio_refill_frames(void);
++#define AUDIO_LATE_WAKE_FRAMES nx_audio_refill_frames()
++#else
+ #define AUDIO_LATE_WAKE_FRAMES ((SR_DISPLAY_PERIOD_US * 44100u + 999999u) / 1000000u)
++
++#endif
+ 
+ static uint32_t audio_host_hold_frames(uint32_t n) {
+     if (!n) return 0u;   /* no period reserved: nothing paces against this queue */
+--- a/src/rt/hle_data.c
++++ b/src/rt/hle_data.c
+@@ -1,3 +1,4 @@
++#include <fcntl.h>
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ // Copyright (C) 2025-2026 the psp-recomp authors
+ // Copyright (C) 2026 the Nakagawa Recomp authors
+@@ -762,169 +763,7 @@
+                      const wchar_t *skip_top_name,
+                      const char exclude_paths[][241], size_t exclude_count,
+                      SrAssetIndex *index, uint32_t precedence) {
+-    if (!root || !mount || !index || exclude_count > SR_DATA_MAX_LOOSE_ROOT_EXCLUDES ||
+-        (exclude_count != 0u && !exclude_paths)) return 0;
+-    DataWalkDir *stack = NULL;
+-    size_t stack_count = 0, stack_capacity = 0;
+-    size_t root_len = wcslen(root);
+-    if (root_len == SIZE_MAX || root_len + 1u > SIZE_MAX / sizeof(wchar_t)) return 0;
+-    wchar_t *initial_host = (wchar_t *)malloc((root_len + 1u) * sizeof(*initial_host));
+-    char *initial_rel = sr_asset_index_strdup("");
+-    if (!initial_host || !initial_rel) {
+-        free(initial_host);
+-        free(initial_rel);
+-        return 0;
+-    }
+-    memcpy(initial_host, root, (root_len + 1u) * sizeof(*initial_host));
+-    if (!data_walk_push(&stack, &stack_count, &stack_capacity, initial_host, initial_rel)) {
+-        free(initial_host);
+-        free(initial_rel);
+-        free(stack);
+-        return 0;
+-    }
+-
+-    int ok = 1;
+-    while (ok && stack_count != 0u) {
+-        DataWalkDir current = stack[--stack_count];
+-#ifdef SR_HLE_THREAD_SELFTEST
+-        /* The Windows walk's test-only pacing hook and work counters, at the same points. */
+-        if (s_data_test_pace_ms > 0) sr_host_sleep_ms(s_data_test_pace_ms);
+-        s_data_test_walk_calls++;
+-#endif
+-        char *host_utf8 = NULL;
+-        if (!sr_wide_to_utf8_alloc(current.host, &host_utf8)) {
+-            fprintf(stderr, "host_data: host-path conversion failed during enumeration\n");
+-            free(current.host);
+-            free(current.rel);
+-            ok = 0;
+-            break;
+-        }
+-        DIR *dir = opendir(host_utf8);
+-        if (!dir) {
+-            fprintf(stderr, "host_data: enumeration failed (errno=%d)\n", errno);
+-            free(host_utf8);
+-            free(current.host);
+-            free(current.rel);
+-            ok = 0;
+-            break;
+-        }
+-        for (;;) {
+-            errno = 0;
+-            struct dirent *entry = readdir(dir);
+-            if (!entry) {
+-                if (errno != 0) {
+-                    fprintf(stderr, "host_data: enumeration terminated with errno=%d\n", errno);
+-                    ok = 0;
+-                }
+-                break;
+-            }
+-#ifdef SR_HLE_THREAD_SELFTEST
+-            s_data_test_scan_names++;
+-#endif
+-            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+-            wchar_t *name = NULL;
+-            wchar_t *child_host = NULL;
+-            char *child_rel = NULL;
+-            char *child_utf8 = NULL;
+-            char *key = NULL;
+-            if (!sr_utf8_to_wide_alloc(entry->d_name, &name) ||
+-                !sr_wide_join_alloc(current.host, name, &child_host) ||
+-                !(child_rel = data_rel_join(current.rel, entry->d_name)) ||
+-                !sr_wide_to_utf8_alloc(child_host, &child_utf8)) {
+-                fprintf(stderr, "host_data: path conversion/join failed during enumeration\n");
+-                ok = 0;
+-            } else {
+-                struct stat st;
+-                /* Classify and probe the entry relative to the open directory, so no path is
+-                 * re-resolved between the check and the open. */
+-                if (fstatat(dirfd(dir), entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+-                    fprintf(stderr, "host_data: entry could not be classified (errno=%d)\n", errno);
+-                    ok = 0;
+-                } else if (S_ISLNK(st.st_mode)) {
+-                    /* This host's reparse point: a link can redirect the walk
+-                     * outside the root, so it is refused, not followed. */
+-                    fprintf(stderr, "host_data: refusing symbolic link %s\n", child_utf8);
+-                    ok = 0;
+-                } else if (S_ISDIR(st.st_mode)) {
+-                    if (skip_top_name && current.rel[0] == '\0' &&
+-                        sr_wide_stricmp(name, skip_top_name) == 0) {
+-                        /* Already enumerated from its own root; do not pay for
+-                         * it twice. */
+-                    } else if (data_loose_path_excluded(child_rel, exclude_paths,
+-                                                        exclude_count)) {
+-                        /* Excluded directories are never pushed onto the walk stack. */
+-                    } else if (!data_walk_push(&stack, &stack_count, &stack_capacity,
+-                                               child_host, child_rel)) {
+-                        fprintf(stderr, "host_data: directory-stack allocation failed\n");
+-                        ok = 0;
+-                    } else {
+-                        child_host = NULL;
+-                        child_rel = NULL;
+-                    }
+-                } else if (!S_ISREG(st.st_mode)) {
+-                    fprintf(stderr, "host_data: refusing non-regular entry %s\n", child_utf8);
+-                    ok = 0;
+-                } else if (data_loose_path_excluded(child_rel, exclude_paths,
+-                                                    exclude_count)) {
+-                    /* An excluded file is not indexed or opened. */
+-                } else {
+-#ifdef SR_HLE_THREAD_SELFTEST
+-                    s_data_test_scan_probes++;
+-#endif
+-                    int probe_fd = openat(dirfd(dir), entry->d_name,
+-                                          O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+-                    struct stat probe_st;
+-                    int probe_ok = probe_fd >= 0 && fstat(probe_fd, &probe_st) == 0 &&
+-                                   S_ISREG(probe_st.st_mode) &&
+-                                   probe_st.st_dev == st.st_dev && probe_st.st_ino == st.st_ino;
+-                    if (probe_fd >= 0) close(probe_fd);
+-                    if (!probe_ok) {
+-                        fprintf(stderr, "host_data: indexed file readability check failed "
+-                                        "(entry=%zu errno=%d)\n", index->count, errno);
+-                        ok = 0;
+-                    } else {
+-                        int variant = -1;
+-                        char *key_relative = mount[0]
+-                            ? data_rel_join(mount, child_rel)
+-                            : sr_asset_index_strdup(child_rel);
+-                        if ((uint64_t)st.st_size > UINT32_MAX) {
+-                            fprintf(stderr, "host_data: indexed file exceeds guest size limit\n");
+-                            ok = 0;
+-                        } else if (!key_relative ||
+-                                   !sr_asset_index_key_from_rel(key_relative, &key, &variant)) {
+-                            fprintf(stderr, "host_data: index-key conversion failed after %zu files\n",
+-                                    index->count);
+-                            ok = 0;
+-                        } else if (!sr_asset_index_add_sized_precedence(
+-                                       index, key, child_utf8, variant,
+-                                       (uint64_t)st.st_size, precedence)) {
+-                            fprintf(stderr, "host_data: index allocation failed after %zu files\n",
+-                                    index->count);
+-                            ok = 0;
+-                        }
+-                        free(key_relative);
+-                    }
+-                }
+-            }
+-            free(name);
+-            free(child_rel);
+-            free(child_host);
+-            free(child_utf8);
+-            free(key);
+-            if (!ok) break;
+-        }
+-        closedir(dir);
+-        free(host_utf8);
+-        free(current.host);
+-        free(current.rel);
+-    }
+-    while (stack_count != 0u) {
+-        DataWalkDir pending = stack[--stack_count];
+-        free(pending.host);
+-        free(pending.rel);
+-    }
+-    free(stack);
+-    return ok;
++    (void)root; (void)mount; return 0;
+ }
+ #endif /* _WIN32 */
+ 
+--- a/src/rt/hle_io.c
++++ b/src/rt/hle_io.c
+@@ -793,70 +793,53 @@
+  * listing reads that same descriptor, so no path is resolved twice. */
+ static uint32_t vfs_overlay_merge_dir_posix(const char *guest_path, SrVfsDirList *list,
+                                             int *found) {
+-    char trimmed[SR_CD_REL_MAX + 16u], rel[SR_CD_REL_MAX];
++#ifdef SR_CD_BACKEND_SWITCH_FAT
++    *found = 0;
++    char trimmed[SR_CD_REL_MAX + 16], rel[SR_CD_REL_MAX] = "";
++    size_t n = strlen(guest_path);
++    if (n >= sizeof(trimmed)) return sr_cd_psp_error(SR_CD_INVALID_PATH);
++    memcpy(trimmed, guest_path, n + 1);
++    while (n && (trimmed[n-1] == '/' || trimmed[n-1] == '\\')) trimmed[--n] = 0;
+     const char *tail = NULL;
+-    size_t n = strlen(guest_path);
+-    if (n >= sizeof(trimmed)) return 0;
+-    memcpy(trimmed, guest_path, n + 1u);
+-    /* A trailing separator names the same directory, as the Win32 host path does. */
+-    while (n > 0u && (trimmed[n - 1u] == '/' || trimmed[n - 1u] == '\\')) trimmed[--n] = '\0';
+-    if (sr_ms0_classify(trimmed, &tail) != SR_MS0_OWNED || !tail) return 0;
+-    while (*tail == '/' || *tail == '\\') tail++;
+-    if (*tail == '\0') rel[0] = '\0'; /* the root itself */
+-    else if (ms0_posix_guest_relpath(trimmed, rel, sizeof(rel)) != SR_CD_OK) return 0;
++    if (sr_ms0_classify(trimmed,&tail) != SR_MS0_OWNED || !tail) return 0;
++    if (*tail && ms0_posix_guest_relpath(trimmed,rel,sizeof(rel)) != SR_CD_OK)
++        return sr_cd_psp_error(SR_CD_INVALID_PATH);
+     sr_cd_root root;
+-    if (ms0_posix_root_open(&root) != SR_CD_OK) return 0;
+-    int dir_fd = -1;
+-    sr_cd_status st = sr_cd__at_walk(root.fd, rel, &dir_fd);
+-    sr_cd_root_close(&root);
+-    if (st == SR_CD_NOT_FOUND) return 0;
+-    if (st != SR_CD_OK) {
+-        fprintf(stderr, "sceIoDopen: refusing '%s': no directory reachable without a link "
+-                        "inside the configured Memory Stick root (%s)\n",
+-                guest_path, sr_cd_status_name(st));
+-        fflush(stderr);
+-        return 0x80010014u; /* SCE_KERNEL_ERROR_ERRNO_FILE_NOT_FOUND, as on Win32 */
+-    }
+-    DIR *dir = fdopendir(dir_fd);
+-    if (!dir) {
+-        close(dir_fd);
+-        return 0x80010005u; /* SCE_KERNEL_ERROR_ERRNO_IO */
+-    }
++    sr_cd_status st = ms0_posix_root_open(&root);
++    if (st != SR_CD_OK) return sr_cd_psp_error(st);
++    char path[SR_FAT_PATH_CAP];
++    st = sr_fat_path(&root,rel,NULL,path);
++    if (st != SR_CD_OK) return sr_cd_psp_error(st);
++    DIR *dir = opendir(path);
++    if (!dir) return errno == ENOENT ? 0 : sr_cd_psp_error(sr_fat_errno());
+     *found = 1;
+-    uint32_t rc = 0;
++    uint32_t status = 0;
+     for (;;) {
+         errno = 0;
+         struct dirent *entry = readdir(dir);
+-        if (!entry) {
+-            if (errno != 0) {
+-                fprintf(stderr, "sceIoDopen: host enumeration of '%s' ended early (errno=%d); "
+-                                "refusing a short listing\n", guest_path, errno);
+-                rc = 0x80010005u;
+-            }
+-            break;
++        if (!entry) { if (errno) status = sr_cd_psp_error(sr_fat_errno()); break; }
++        const char *name = entry->d_name;
++        if (!sr_cd_name_is_acceptable(name,strlen(name))) continue;
++        char child[SR_FAT_PATH_CAP];
++        struct stat meta;
++        st = sr_fat_path(&root,rel,name,child);
++        if (st != SR_CD_OK) { status = sr_cd_psp_error(st); break; }
++        if (stat(child,&meta) != 0) {
++            if (errno == ENOENT) continue;
++            status = sr_cd_psp_error(sr_fat_errno()); break;
+         }
+-        if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
+-        struct stat child;
+-        if (fstatat(dirfd(dir), entry->d_name, &child, AT_SYMLINK_NOFOLLOW) != 0) {
+-            if (errno == ENOENT) continue; /* removed since readdir named it */
+-            fprintf(stderr, "sceIoDopen: host child of '%s' cannot be classified (errno=%d); "
+-                            "refusing a short listing\n", guest_path, errno);
+-            rc = 0x80010005u;
+-            break;
++        if (!S_ISDIR(meta.st_mode) && (!S_ISREG(meta.st_mode) ||
++            (uint64_t)meta.st_size > UINT32_MAX)) { ++list->skipped; continue; }
++        if (!sr_vfs_dirlist_merge(list,name,S_ISDIR(meta.st_mode),
++             S_ISDIR(meta.st_mode) ? 0u : (uint64_t)meta.st_size)) {
++            status = 0x80010008u; break;
+         }
+-        int is_dir = S_ISDIR(child.st_mode);
+-        if (!is_dir && (uint64_t)child.st_size > UINT32_MAX) {
+-            fprintf(stderr, "sceIoDopen: host file '%s' exceeds the guest size limit; "
+-                            "skipping one entry\n", entry->d_name);
+-            list->skipped++;
+-        } else if (!sr_vfs_dirlist_merge(list, entry->d_name, is_dir,
+-                                         is_dir ? 0u : (uint64_t)child.st_size)) {
+-            rc = 0x80010008u; /* SCE_KERNEL_ERROR_NO_MEMORY */
+-            break;
+-        }
+-    }
+-    closedir(dir);
+-    return rc;
++    }
++    if (closedir(dir) && !status) status = sr_cd_psp_error(SR_CD_IO_ERROR);
++    return status;
++#else
++    (void)guest_path; (void)list; *found=0; return 0;
++#endif
+ }
+ #endif
+ 
+--- a/src/rt/hle_utility.c
++++ b/src/rt/hle_utility.c
+@@ -532,19 +532,24 @@
+     dialog_unlock();
+     return 0;
+ }
+-/* The answer a message dialog confirmed at once gives: its default button. There is no message
+- * dialog UI, so the runtime presses the button the cursor starts on, which is what a person
+- * pressing X straight away gets. PSPSDK psputility_msgdialog.h: options bit 0x10 asks for
+- * YES/NO buttons and bit 0x100 puts the cursor on NO; buttonPressed reads 1 for YES (and OK) and
+- * 2 for NO. A "delete this save? (default No)" prompt is therefore answered No, never Yes. */
+-#define MSG_DIALOG_OPTION_YESNO      0x10u
+-#define MSG_DIALOG_OPTION_DEFAULT_NO 0x100u
+-static uint32_t msg_dialog_default_answer(uint32_t param) {
+-    const uint32_t options = MEM_R32(param + 0x23c);
+-    const int no = (options & MSG_DIALOG_OPTION_YESNO) && (options & MSG_DIALOG_OPTION_DEFAULT_NO);
+-    fprintf(stderr, "sceUtilityMsgDialog: no dialog UI; answered %s, the default button "
+-            "(options 0x%08" PRIx32 ")\n", no ? "NO" : "YES/OK", options);
+-    return no ? 2u : 1u;
++#include "dialogs.h"
++
++static uint32_t msg_dialog_answer(uint32_t param, uint32_t size) {
++    const uint32_t options = size >= 0x244 ? MEM_R32(param + 0x23c) : 0;
++    const int yes_no = (options & 0x10u) != 0;
++    char message[513] = {0};
++    if (MEM_R32(param + 0x34) == 0) {
++        snprintf(message, sizeof(message), "Game error 0x%08" PRIx32, MEM_R32(param + 0x38));
++    } else {
++        for (size_t i = 0; i < 512; ++i) {
++            message[i] = (char)MEM_R8(param + 0x3c + (uint32_t)i);
++            if (!message[i]) break;
++        }
++    }
++    const char *choices[] = {yes_no ? "Yes" : "OK", "No"};
++    int selected = nx_choose("Persona", message, choices, yes_no ? 2 : 1,
++                             yes_no && (options & 0x100u), !(options & 0x80u));
++    return selected < 0 ? 3u : (uint32_t)selected + 1u;
+ }
+ static uint32_t utility_dialog_update(UtilityDialog *d) {
+     uint32_t param = 0, generation = 0, result = 0;
+@@ -585,14 +590,11 @@
+             result = sr_savedata_prepare_utility(SR_UTILITY_STORAGE_GAMEDATA);
+         else if (kind == UTILITY_GAMESHARING)
+             result = sr_savedata_prepare_utility(SR_UTILITY_STORAGE_GAMESHARING);
+-        /* The message dialog answers with its default button (msg_dialog_default_answer). The
+-         * answer goes to buttonPressed at +0x240, which exists from the 580-byte (V2) parameter
+-         * block on; +0x23c is the caller's options word (YES/NO, default NO, ...) and is
+-         * input, never written (PPSSPP Core/Dialog/PSPMsgDialog.h pspMessageDialog: V1 ends
+-         * at 572 bytes, V2 adds options and buttonPressed, V3 is 708 bytes). Writing the
+-         * answer into options left buttonPressed 0, which a yes/no caller reads as "no". */
+-        else if (kind == UTILITY_MSG && MEM_R32(param) >= 0x244u)
+-            MEM_W32(param + 0x240, msg_dialog_default_answer(param));
++        else if (kind == UTILITY_MSG && MEM_R32(param) >= 0x23cu) {
++            uint32_t size = MEM_R32(param);
++            uint32_t answer = msg_dialog_answer(param, size);
++            if (size >= 0x244u) MEM_W32(param + 0x240, answer);
++        }
+         dialog_lock();
+         if (generation == d->generation) {
+             d->result = result;
+--- a/src/rt/mpeg.c
++++ b/src/rt/mpeg.c
+@@ -29,6 +29,9 @@
+ #endif
+ #include "recomp.h"
+ #include "sr_h264.h"
++#ifdef __SWITCH__
++#include <arm_neon.h>
++#endif
+ #include "ge_shared.h"       /* movie provenance (#2111) */
+ #include "psmf_producer.h"
+ #include "atrac3p_bridge.h"
+@@ -570,7 +573,7 @@
+ 
+ uint32_t mpeg_init(void) { s_mpegInit = 1; return 0; }
+ uint32_t mpeg_finish(void) {
+-#ifdef SR_SDL3VK
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG)
+     for (int i = 0; i < 8; i++) if (s_mpeg[i].used && s_mpeg[i].h264 >= 0) {
+         sr_h264_destroy(s_mpeg[i].h264);
+         s_mpeg[i].h264 = -1;
+@@ -700,7 +703,7 @@
+     if (!ctx) return (uint32_t)-1;
+     mpeg_pictures_report(ctx, "delete");
+     sr_movie_forget_owner(ctx->guestAddr);   /* its pictures are no longer movie frames (#2111) */
+-#ifdef SR_SDL3VK
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG)
+     if (ctx->h264 >= 0) { sr_h264_destroy(ctx->h264); ctx->h264 = -1; }
+ #endif
+     ycbcr_reset_mpeg(ctx->guestAddr);
+@@ -873,7 +876,7 @@
+             !sr_guest_span_readable_current(dst, gotBytes))
+             return 0;
+ 
+-#if defined(SR_SDL3VK) || defined(SR_MPEG_MEDIA_SELFTEST)
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG) || defined(SR_MPEG_MEDIA_SELFTEST)
+         if (ctx && got) {
+             if (!ctx->h264Init) { ctx->h264Init = 1; ctx->h264 = sr_h264_create(); }
+             if (ctx->h264 >= 0 &&
+@@ -965,7 +968,7 @@
+         return 0;
+     }
+     uint32_t release = 1;   /* timestamp model: one packet per access unit */
+-#if defined(SR_SDL3VK) || defined(SR_MPEG_MEDIA_SELFTEST)
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG) || defined(SR_MPEG_MEDIA_SELFTEST)
+     /* With a decoder, an access unit is one real picture of the demuxed stream: hand it out only
+      * once it has been fed completely, and release exactly the ring packets it consumed. */
+     if (ctx->h264Init && ctx->h264 >= 0) {
+@@ -1045,7 +1048,7 @@
+      * it ahead of the first video AU, which can make libpsmfplayer reject the video as too early.
+      * Keep the demuxer's firstAudioPts for diagnostics, but do not substitute it for the public
+      * sceMpeg AU time base. */
+-#if defined(SR_SDL3VK) || defined(SR_MPEG_MEDIA_SELFTEST)
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG) || defined(SR_MPEG_MEDIA_SELFTEST)
+     /* A context that never saw the PSMF header (a guest PSMF player parses it with scePsmf) takes
+      * its presentation origin from the stream's first video picture, as its first sceMpegGetAvcAu
+      * would.  Without it the ATRAC units handed out before that carried a clock from 0: title X's
+@@ -1152,7 +1155,7 @@
+     }
+     ctx->videoPts += videoTimestampStep;
+     int gotFrame = 0;
+-#ifdef SR_SDL3VK
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG)
+     {
+         int eos = ctx->streamEnded;
+         SrH264FrameTarget target;
+@@ -1606,6 +1609,27 @@
+     if (!ycbcr_planes_writable(l, w, h) || !ycbcr_planes_in(l, w, h))
+         return mpeg_contract_error("sceMpegAvcDecodeYCbCr", "the header's plane pointers do not reach guest memory",
+                                    SCE_MPEG_ERROR_INVALID_VALUE);
++#ifdef __SWITCH__
++    if (pw == (int)w && ph == (int)h) {
++        for (uint32_t y=0; y<h; ++y) {
++            for (uint32_t x=0; x<w; x+=16) {
++                int plane;
++                uint32_t off=ycbcr_luma_at(x,y,h,&plane);
++                memcpy(ycbcr_scratch_plane(plane)+off,s_ycbcr_y+y*YCBCR_SCRATCH_W+x,16);
++            }
++        }
++        for (uint32_t y=0; y<h/2; ++y) {
++            for (uint32_t x=0; x<w/2; x+=8) {
++                int plane;
++                uint32_t off=ycbcr_chroma_at(x,y,h,&plane);
++                uint32_t pos=y*(YCBCR_SCRATCH_W/2)+x;
++                uint8x8x2_t uv={{vld1_u8(s_ycbcr_cb+pos),vld1_u8(s_ycbcr_cr+pos)}};
++                vst2_u8(ycbcr_scratch_plane(plane)+off,uv);
++            }
++        }
++    } else
++#endif
++    {
+     int plane;
+     for (uint32_t y = 0; y < (uint32_t)ph; y++)
+         for (uint32_t x = 0; x < (uint32_t)pw; x++) {
+@@ -1618,6 +1642,7 @@
+             ycbcr_scratch_plane(plane)[off] = s_ycbcr_cb[cy * (YCBCR_SCRATCH_W / 2u) + cx];
+             ycbcr_scratch_plane(plane)[off + 1u] = s_ycbcr_cr[cy * (YCBCR_SCRATCH_W / 2u) + cx];
+         }
++    }
+     ycbcr_planes_out(l, w, h);
+     MEM_W32(buf, h / 16u);
+     MEM_W32(buf + 4u, w / 16u);
+@@ -1662,7 +1687,7 @@
+     int got = 0;
+     SrH264FrameInfo info = {0};
+     int eos = ctx->streamEnded;
+-#ifdef SR_SDL3VK
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG)
+     /* A host decoder behind the PSP's one-unit lag (the guest took units before their data reached
+      * it) catches up here, several pictures in one call.  Each pull has its own info: a pull that
+      * finds no picture clears only its own, never the size of the picture already in the scratch
+@@ -1759,7 +1784,7 @@
+                                    SCE_MPEG_ERROR_INVALID_VALUE);
+     int got = 0;
+     SrH264FrameInfo info = {0};
+-#ifdef SR_SDL3VK
++#if defined(SR_SDL3VK) || defined(SR_H264_FFMPEG)
+     if (ctx->h264Init && ctx->h264 >= 0) {
+         SrH264FrameTarget target;
+         memset(&target, 0, sizeof(target));
+@@ -1843,6 +1868,42 @@
+     }
+     return 0;
+ }
++
++#ifdef __SWITCH__
++/* Convert eight movie pixels using the PSP's signed 7-bit fixed point formula.
++ * Saturating narrowing at the end preserves superwhite and extreme chroma. */
++static uint8x8_t movie_component(int32x4_t low, int32x4_t high) {
++    return vqmovun_s16(vcombine_s16(vshrn_n_s32(low,7), vshrn_n_s32(high,7)));
++}
++static void movie_rgb8(uint8_t *out, uint8x8_t y, int16x8_t u, int16x8_t v) {
++    int16x8_t l = vreinterpretq_s16_u16(vmovl_u8(vqsub_u8(y,vdup_n_u8(16))));
++    int32x4_t lo = vmlal_n_s16(vdupq_n_s32(64),vget_low_s16(l),149);
++    int32x4_t hi = vmlal_n_s16(vdupq_n_s32(64),vget_high_s16(l),149);
++    uint8x8x4_t rgba;
++    rgba.val[0]=movie_component(vmlal_n_s16(lo,vget_low_s16(v),204),vmlal_n_s16(hi,vget_high_s16(v),204));
++    rgba.val[1]=movie_component(vmlsl_n_s16(vmlsl_n_s16(lo,vget_low_s16(u),50),vget_low_s16(v),104),
++                                vmlsl_n_s16(vmlsl_n_s16(hi,vget_high_s16(u),50),vget_high_s16(v),104));
++    rgba.val[2]=movie_component(vmlal_n_s16(lo,vget_low_s16(u),258),vmlal_n_s16(hi,vget_high_s16(u),258));
++    rgba.val[3]=vdup_n_u8(0);
++    vst4_u8(out,rgba);
++}
++static void movie_rgb_row(uint8_t *out, uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
++    for (uint32_t col=0; col<width; col+=16) {
++        int lp, cp;
++        uint32_t lo=ycbcr_luma_at(x+col,y,height,&lp);
++        uint32_t co=ycbcr_chroma_at((x+col)/2,y/2,height,&cp);
++        const uint8_t *luma=ycbcr_scratch_plane(lp)+lo;
++        uint8x8x2_t uv=vld2_u8(ycbcr_scratch_plane(cp)+co);
++        uint8x8x2_t uu=vzip_u8(uv.val[0],uv.val[0]), vv=vzip_u8(uv.val[1],uv.val[1]);
++        for (unsigned half=0; half<2; ++half) {
++            int16x8_t u=vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(uu.val[half])),vdupq_n_s16(128));
++            int16x8_t v=vsubq_s16(vreinterpretq_s16_u16(vmovl_u8(vv.val[half])),vdupq_n_s16(128));
++            movie_rgb8(out+4*col+32*half,vld1_u8(luma+8*half),u,v);
++        }
++    }
++}
++
++#endif
+ 
+ /* sceMpegAvcCsc(mpeg, ycbcr, range*, frameWidth, dest): range is {x, y, w, h} in pixels.
+  * MEASURED (PSP-MPEG-001, picture 480x224): an odd x or w is refused with
+@@ -1924,6 +1985,11 @@
+         (void)out;
+         (void)rowAddr;
+ #else
++#ifdef __SWITCH__
++        if (ctx->pixelMode == 3 && !mode2 && !(x & 15) && !(w & 15))
++            movie_rgb_row(out,(uint32_t)x,row,(uint32_t)w,l.height);
++        else
++#endif
+         for (uint32_t col = 0; col < (uint32_t)w && !mode2; col++) {
+             const uint32_t sx = (uint32_t)x + col, sy = row;
+             int lp, cp;
+--- a/src/rt/savedata.c
++++ b/src/rt/savedata.c
+@@ -266,7 +266,7 @@
+     if (strncmp(path, ms_root(), root_len) != 0) return 0;
+     return sr_vfs_mkdirs_contained(tail, canonical_root);
+ #else
+-#if defined(SR_CD_BACKEND_POSIX_AT)
++#if (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     char rel[SR_CD_REL_MAX];
+     if (!savedata_root_relative(path, rel, sizeof(rel))) return 0;
+     /* The configured root is operator-owned, and creating that bare root is
+@@ -382,7 +382,7 @@
+     if (size) *size = (uint32_t)bytes_read;
+     return ok ? 1 : 0;
+ #else
+-#if defined(SR_CD_BACKEND_POSIX_AT)
++#if (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     char rel[SR_CD_REL_MAX];
+     if (!savedata_root_relative(dir, rel, sizeof(rel))) return 0;
+     sr_cd_root root;
+@@ -443,7 +443,7 @@
+     if (size) *size = ((uint64_t)info.nFileSizeHigh << 32) | info.nFileSizeLow;
+     if (mtime) *mtime = (int64_t)(ft.QuadPart / 10000000u) - 11644473600;
+     return 1;
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     char rel[SR_CD_REL_MAX];
+     if (!savedata_root_relative(dir, rel, sizeof(rel))) return 0;
+     sr_cd_root root;
+@@ -501,7 +501,7 @@
+     }
+     CloseHandle(h);
+     return result;
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     char rel[SR_CD_REL_MAX];
+     if (!savedata_root_relative(dir, rel, sizeof(rel))) return 0;
+     sr_cd_root root;
+@@ -548,7 +548,10 @@
+     size_t count = 0, cap = 0;
+     int ok = 1;
+     struct dirent *de;
+-    while ((de = readdir(d)) != NULL) {
++    for (;;) {
++        errno = 0;
++        de = readdir(d);
++        if (!de) { if (errno) ok = 0; break; }
+         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..") ||
+             savedata_is_reserved_name(de->d_name))
+             continue;
+@@ -703,7 +706,7 @@
+ #ifdef _WIN32
+     wchar_t canonical_root[MAX_PATH * 2];
+     wchar_t final_dir[MAX_PATH * 2];     /* the directory's own verified final path */
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     sr_cd_root root;
+     char rel[SR_CD_REL_MAX];
+ #endif
+@@ -760,7 +763,7 @@
+ #endif
+ 
+ static void sd_dir_close(SavedataDir *d) {
+-#if !defined(_WIN32) && defined(SR_CD_BACKEND_POSIX_AT)
++#if !defined(_WIN32) && (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     if (d->open) sr_cd_root_close(&d->root);
+ #endif
+     d->open = 0;
+@@ -780,7 +783,7 @@
+     int ok = sd_win_final(h, d->final_dir, sizeof(d->final_dir) / sizeof(wchar_t), &slash);
+     CloseHandle(h);
+     if (!ok) return 0;
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     if (!savedata_root_relative(dir, d->rel, sizeof(d->rel))) return 0;
+     if (sr_cd_root_open(ms_root(), &d->root) != SR_CD_OK) return 0;
+ #else
+@@ -827,7 +830,7 @@
+     }
+     CloseHandle(fh);
+     if (!ok) return 0;
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     FILE *f = NULL;
+     sr_cd_status st = sr_cd_open_file(&d->root, d->rel, name, SR_CD_FILE_READ, &f);
+     if (st == SR_CD_NOT_FOUND) return 1;
+@@ -880,15 +883,20 @@
+     time_ok = SetFileTime(h, NULL, &ft, &ft) != 0;
+     if (ok) ok = FlushFileBuffers(h) != 0;
+     CloseHandle(h);
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     FILE *f = NULL;
+     if (sr_cd_open_file(&d->root, d->rel, name, SR_CD_FILE_READ_WRITE_NEW, &f) != SR_CD_OK || !f)
+         return 0;
+     ok = !n || fwrite(data, 1, n, f) == n;
+     if (ok && fflush(f) != 0) ok = 0;
+     if (!ok && nospace) *nospace = errno == ENOSPC;
++#ifdef SR_CD_BACKEND_SWITCH_FAT
++    (void)mtime;
++    time_ok = 0; /* libnx exposes the SD file's host time read-only. */
++#else
+     struct timespec times[2] = { { (time_t)mtime, 0 }, { (time_t)mtime, 0 } };
+     time_ok = futimens(fileno(f), times) == 0;
++#endif
+     if (ok && fsync(fileno(f)) != 0) ok = 0;
+     if (fclose(f) != 0) ok = 0;
+ #else
+@@ -961,7 +969,7 @@
+         }
+     }
+     CloseHandle(h);
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     char a[SR_CD_REL_MAX], b[SR_CD_REL_MAX];
+     ok = snprintf(a, sizeof(a), "%s/%s", d->rel, from) < (int)sizeof(a) &&
+          snprintf(b, sizeof(b), "%s/%s", d->rel, to) < (int)sizeof(b) &&
+@@ -1002,7 +1010,7 @@
+         if (!ok) ok = sr_vfs_dispose_by_handle(h);
+     }
+     CloseHandle(h);
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     sr_cd_status st = sr_cd_delete_leaf(&d->root, d->rel, name);
+     ok = st == SR_CD_OK || st == SR_CD_NOT_FOUND;
+ #else
+@@ -1025,7 +1033,7 @@
+         ok = FlushFileBuffers(h) != 0;
+         CloseHandle(h);
+     }
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     ok = sr_cd_sync_dir(&d->root, d->rel) == SR_CD_OK;
+ #else
+     (void)d;
+@@ -1239,7 +1247,12 @@
+         (void)prev_name(pn, sizeof(pn), sl->name);
+         (void)stage_name(sn, sizeof(sn), i);
+         if (act[i] == RESTORE) {
++#ifdef SR_CD_BACKEND_SWITCH_FAT
++            if (m[i].present && !sd_delete(d, sl->name)) return 0;
++            if (!sd_rename(d, pn, sl->name, 0)) return 0;
++#else
+             if (!sd_rename(d, pn, sl->name, m[i].present)) return 0;
++#endif
+             p[i].present = 0;
+         } else if (act[i] == REMOVE) {
+             if (!sd_drop(d, sl->name, sl->name)) return 0;
+@@ -1456,7 +1469,7 @@
+         return SD_LOCK_BUSY;
+     }
+     s_sd_lock = h;
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     sr_cd_root r;
+     int fd = -1;
+     if (sr_cd_root_open(ms_root(), &r) != SR_CD_OK) return SD_LOCK_BUSY;
+@@ -1489,7 +1502,7 @@
+ #ifdef _WIN32
+     if (s_sd_lock) CloseHandle(s_sd_lock);
+     s_sd_lock = NULL;
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     sr_cd_unlock_dir(s_sd_lock_fd);
+     s_sd_lock_fd = -1;
+ #endif
+@@ -2095,7 +2108,7 @@
+     struct stat st;
+     return stat(dir, &st) == 0 && S_ISDIR(st.st_mode);
+ #else
+-#if defined(SR_CD_BACKEND_POSIX_AT)
++#if (defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT))
+     char rel[SR_CD_REL_MAX];
+     if (!savedata_root_relative(dir, rel, sizeof(rel))) return 0;
+     sr_cd_root root;
+@@ -2862,6 +2875,8 @@
+  * Every selection is logged. A list mode whose list is absent or empty, or a LISTSAVE list that
+  * yields no row, uses saveName. Returns 0 or a result code: LISTLOAD/LISTDELETE with no listed
+  * save (the dialog's "There is no data"), or an unreadable list. */
++#include "dialogs.h"
++
+ static uint32_t resolve_save(uint32_t param, uint32_t size, uint32_t mode, const char *game,
+                              char *save, int cap, SaveChoice *choice) {
+     memset(choice, 0, sizeof(*choice));
+@@ -2894,6 +2909,20 @@
+         }
+         rd_cstr(at, ent, 21);
+         if (!ent[0]) break;
++#ifdef SR_CD_BACKEND_SWITCH_FAT
++        /* The title tests 99 candidate slots. A fresh, empty directory listing
++         * settles them all for this request without 99 SD filesystem calls. */
++        if (mode == SD_LISTLOAD) {
++            if (!names_read) {
++                names_read = savedata_sorted_names(root, &names, &name_count) ? 1 : -1;
++                if (names_read < 0) {
++                    struct stat st;
++                    if (stat(root, &st) != 0 && errno == ENOENT) names_read = 1;
++                }
++            }
++            if (names_read > 0 && !name_count) continue;
++        }
++#endif
+         if (!strcmp(ent, "<>")) {
+             if (!names_read) names_read = savedata_sorted_names(root, &names, &name_count) ? 1 : -1;
+             size_t gl = strlen(game);
+@@ -2940,13 +2969,30 @@
+             return 0;
+         }
+         pick = chosen;
+-    } else if (mode == SD_LISTDELETE) {
+-        fprintf(stderr, "savedata: LISTDELETE of %zu rows cancelled: there is no list UI and no save "
+-                "is deleted that nobody chose (SR_SAVEDATA_LIST_SELECT=<saveName> chooses one)\n", count);
+-        choice->cancel = 1;
+-        return 0;
+-    } else if (mode == SD_LISTSAVE && rows[pick].exists) {
+-        choice->keep_previous = 1;
++    } else {
++        char labels[SAVEDATA_MAX_FILE_ENTRIES][48];
++        const char *items[SAVEDATA_MAX_FILE_ENTRIES];
++        for (size_t i = 0; i < count; ++i) {
++            snprintf(labels[i], sizeof(labels[i]), "%s  [%s]", rows[i].name,
++                     rows[i].exists ? "Saved" : "Empty");
++            items[i] = labels[i];
++        }
++        const char *title = mode == SD_LISTSAVE ? "Save Game" :
++                            mode == SD_LISTDELETE ? "Delete Save" : "Load Game";
++        int selected = nx_choose(title, "Choose a save slot.", items, count, pick, 1);
++        if (selected < 0) { choice->cancel = 1; return 0; }
++        pick = (size_t)selected;
++        if (rows[pick].exists && mode != SD_LISTLOAD) {
++            const char *options[] = {"Yes", "No"};
++            char prompt[96];
++            snprintf(prompt, sizeof(prompt), "%s slot %s?",
++                     mode == SD_LISTDELETE ? "Delete" : "Overwrite", rows[pick].name);
++            if (nx_choose(title, prompt, options, 2, 1, 1) != 0) {
++                choice->cancel = 1;
++                return 0;
++            }
++            choice->keep_previous = mode == SD_LISTSAVE;
++        }
+     }
+     snprintf(save, (size_t)cap, "%s", rows[pick].name);
+     fprintf(stderr, "savedata: %s list of %zu rows, focus %" PRIu32 ": %s row %zu '%s'%s\n",
+--- a/src/rt/sched.c
++++ b/src/rt/sched.c
+@@ -80,10 +80,7 @@
+ void sched_liveness_set_starvation_limit(unsigned limit);
+ #endif
+ 
+-#include <SDL3/SDL_mutex.h>
+-#include <SDL3/SDL_thread.h>
+-#include <SDL3/SDL_timer.h>
+-#include <SDL3/SDL_video.h>
++#include "scheduler_host.h"
+ #include <stdio.h>
+ #include <string.h>
+ #include <setjmp.h>
+@@ -6003,7 +6000,7 @@
+              * host whose page file or address space is constrained, so sr_coro_create may
+              * return NULL. Switching to a NULL coroutine would crash, so a failure is reported
+              * and the run aborts: a thread that never started cannot be recovered. */
+-            t->coro = sr_coro_create(coro_body, t, SR_GUEST_CORO_STACK_SIZE);
++            t->coro = sr_coro_create(coro_body, t, (4u << 20));
+             if (!t->coro) {
+                 fprintf(stderr, "sched_run: sr_coro_create failed for uid=0x%x entry=0x%08x "
+                         "-- cannot continue\n",
+--- a/src/rt/sr_coro.c
++++ b/src/rt/sr_coro.c
+@@ -374,7 +374,8 @@
+ #if !defined(SR_CORO_ASM)
+ #include <ucontext.h>
+ #endif
+-#include <sys/mman.h>
++#include <switch.h>
++#include <malloc.h>
+ #include <pthread.h>
+ #include <unistd.h>
+ #include <string.h>
+@@ -548,13 +549,10 @@
+              * stack's bounds are unavailable, the dispatcher stops with the named
+              * host-fiber-stack-bounds-unavailable reason rather than a guess. Guest fibers
+              * do not take this path. */
+-            pthread_attr_t attr;
+-            void *stack_addr = NULL;
+-            if (pthread_getattr_np(pthread_self(), &attr) != 0) return 0;
+-            int attr_result = pthread_attr_getstack(&attr, &stack_addr, &stack_size);
+-            pthread_attr_destroy(&attr);
+-            if (attr_result != 0 || !stack_addr) return 0;
+-            s_current->stack = stack_addr;
++            Thread *thread = threadGetSelf();
++            if (!thread || !thread->stack_mirror || !thread->stack_sz) return 0;
++            s_current->stack = thread->stack_mirror;
++            stack_size = thread->stack_sz;
+             s_current->stack_size = stack_size;
+         }
+         low = (uintptr_t)s_current->stack;
+@@ -647,27 +645,19 @@
+     c->arg = arg;
+     c->stack_size = stack_size;
+     /* The guard band (see sr_coro.h) sits below the usable range, page aligned. */
+-    long page = sysconf(_SC_PAGESIZE);
+-    size_t guard = SR_CORO_STACK_GUARD_BYTES;
+-    if (page > 0) guard = (guard + (size_t)page - 1u) / (size_t)page * (size_t)page;
+-    if (stack_size == 0 || stack_size > SIZE_MAX - guard) { free(c); return NULL; }
+-    c->map_size = stack_size + guard;
+-    /* MAP_NORESERVE gives lazy commit like a Win32 fiber's reserved stack: the full range is
+-     * addressable but physical pages are only backed as the deep call chain touches them, so a
+-     * large per-coroutine stack does not cost real memory while the coroutine is idle. */
+-    c->map = mmap(NULL, c->map_size, PROT_READ | PROT_WRITE,
+-                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+-    if (c->map == MAP_FAILED) { free(c); return NULL; }
+-    if (mprotect(c->map, guard, PROT_NONE) != 0) {
+-        munmap(c->map, c->map_size);
+-        free(c);
+-        return NULL;
+-    }
+-    c->stack = (unsigned char *)c->map + guard;
++    if (!stack_size || stack_size > SIZE_MAX-0xFFF) { free(c); return NULL; }
++    c->map_size = (stack_size+0xFFF) & ~(size_t)0xFFF;
++    c->map = memalign(0x1000,c->map_size);
++    if (!c->map) {free(c); return NULL;}
++    virtmemLock();
++    c->stack = virtmemFindStack(c->map_size, SR_CORO_STACK_GUARD_BYTES);
++    Result result = c->stack ? svcMapMemory(c->stack,c->map,c->map_size) : 1;
++    virtmemUnlock();
++    if (R_FAILED(result)) { free(c->map); free(c); return NULL; }
+ #if defined(SR_CORO_ASM)
+-    if (!coro_initial_frame(c)) { munmap(c->map, c->map_size); free(c); return NULL; }
++    if (!coro_initial_frame(c)) { svcUnmapMemory(c->stack,c->map,c->map_size); free(c->map); free(c); return NULL; }
+ #else
+-    if (getcontext(&c->ctx) != 0) { munmap(c->map, c->map_size); free(c); return NULL; }
++    if (getcontext(&c->ctx) != 0) { svcUnmapMemory(c->stack,c->map,c->map_size); free(c->map); free(c); return NULL; }
+     c->ctx.uc_stack.ss_sp = c->stack;
+     c->ctx.uc_stack.ss_size = stack_size;
+     c->ctx.uc_link = NULL;   /* body never returns */
+@@ -694,7 +684,7 @@
+ void sr_coro_destroy(SrCoro *c) {
+     if (!c) return;
+     if (!LC_DESTROY_OK(c)) return;   /* instrumented builds: refuse an invalid destroy */
+-    if (c->map && c->map != MAP_FAILED && !c->is_main) munmap(c->map, c->map_size);
++    if (c->map && !c->is_main) { svcUnmapMemory(c->stack,c->map,c->map_size); free(c->map); }
+     free(c);
+ }
+ 
+--- a/src/rt/vfs_contained.h
++++ b/src/rt/vfs_contained.h
+@@ -137,6 +137,13 @@
+  * evidence rather than a claim; production builds never define it. */
+ #if defined(SR_CD_FORCE_UNSUPPORTED_BACKEND)
+ #define SR_CD_BACKEND_NONE 1
++#elif defined(__SWITCH__) || defined(SR_CD_FAT_TEST)
++#define SR_CD_BACKEND_SWITCH_FAT 1
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ #elif defined(_WIN32)
+ #define SR_CD_BACKEND_WINDOWS 1
+ #include <dirent.h>
+@@ -161,7 +168,7 @@
+ #endif
+ 
+ #if !defined(SR_CD_BACKEND_WINDOWS) && !defined(SR_CD_BACKEND_POSIX_AT) && \
+-    !defined(SR_CD_BACKEND_NONE)
++    !defined(SR_CD_BACKEND_NONE) && !defined(SR_CD_BACKEND_SWITCH_FAT)
+ #define SR_CD_BACKEND_NONE 1
+ #endif
+ 
+@@ -260,6 +267,8 @@
+     char prefix[SR_CD_HOST_PATH_MAX];
+ #elif defined(SR_CD_BACKEND_POSIX_AT)
+     int fd;
++#elif defined(SR_CD_BACKEND_SWITCH_FAT)
++    char prefix[1024];
+ #else
+     int unused;
+ #endif
+@@ -270,6 +279,8 @@
+     return "windows-verified-handle";
+ #elif defined(SR_CD_BACKEND_POSIX_AT)
+     return "posix-descriptor-relative";
++#elif defined(SR_CD_BACKEND_SWITCH_FAT)
++    return "switch-sdmc-fat";
+ #else
+     return "unsupported";
+ #endif
+@@ -282,7 +293,7 @@
+      * with no residual window. */
+     return SR_CD_GUARANTEE_CONTAINMENT | SR_CD_GUARANTEE_NO_LINK_TRAVERSAL |
+            SR_CD_GUARANTEE_TYPE_ENFORCED | SR_CD_GUARANTEE_DIR_OBJECT_BOUND;
+-#elif defined(SR_CD_BACKEND_POSIX_AT)
++#elif defined(SR_CD_BACKEND_POSIX_AT) || defined(SR_CD_BACKEND_SWITCH_FAT)
+     /* DIR_OBJECT_BOUND is deliberately absent: POSIX.1-2008 cannot express a
+      * descriptor-addressed directory removal. Detection is implemented and a
+      * detected replacement fails closed, but detection is not a guarantee. */
+@@ -1522,6 +1533,8 @@
+ /* Fail-closed backend for hosts with no containment implementation yet.    */
+ /* Deliberately destroys nothing rather than offering a pathname fallback.  */
+ /* ======================================================================== */
++#elif defined(SR_CD_BACKEND_SWITCH_FAT)
++#include "vfs_switch_fat.h"
+ #else
+ 
+ /* No host grammar can be honoured because no host operation will be performed.
+--- /dev/null
++++ b/src/rt/vfs_switch_fat.h
+@@ -0,0 +1,246 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++/* libnx sdmc: exposes only FAT regular files and directories. A validated
++ * component cannot redirect to another filesystem. This backend must never
++ * be selected for a desktop filesystem or a different Horizon device. */
++#ifndef SR_VFS_SWITCH_FAT_H
++#define SR_VFS_SWITCH_FAT_H
++
++#define SR_FAT_PATH_CAP 1024
++#define SR_FAT_PREVIOUS ".~sr-old"
++#if defined(SR_CD_FAT_TEST)
++#define SR_FAT_PREFIX "fat-test-volume/"
++#if defined(_WIN32)
++#include <direct.h>
++#include <io.h>
++#define sr_fat_mkdir(p) _mkdir(p)
++#endif
++#else
++int nx_sdmc_commit(void);
++#define SR_FAT_PREFIX "sdmc:/"
++#endif
++#ifndef sr_fat_mkdir
++#define sr_fat_mkdir(p) mkdir((p),0777)
++#endif
++#ifndef O_BINARY
++#define O_BINARY 0
++#endif
++
++static inline int sr_cd_component_is_host_ok(const char *c,size_t n) {
++    size_t suffix=sizeof(SR_FAT_PREVIOUS)-1;
++    return sr_vfs_is_safe_component(c,n) &&
++           !(n>=suffix && !sr_vfs_strnicmp(c+n-suffix,SR_FAT_PREVIOUS,suffix));
++}
++static inline sr_cd_status sr_fat_errno(void) {
++    switch(errno) {
++        case ENOENT: return SR_CD_NOT_FOUND;
++        case ENOTDIR: return SR_CD_NOT_A_DIRECTORY;
++        case EISDIR: return SR_CD_IS_DIRECTORY;
++        case EEXIST: return SR_CD_ALREADY_EXISTS;
++        case ENOTEMPTY: return SR_CD_NOT_EMPTY;
++        case EINVAL: case ENAMETOOLONG: return SR_CD_INVALID_PATH;
++        default: return SR_CD_IO_ERROR;
++    }
++}
++static inline sr_cd_status sr_cd_root_open(const char *name,sr_cd_root *root) {
++    if (!root) return SR_CD_INVALID_PATH;
++    root->prefix[0]=0;
++    size_t base=sizeof(SR_FAT_PREFIX)-1;
++    if (!name || strncmp(name,SR_FAT_PREFIX,base) || strlen(name)>=sizeof(root->prefix) ||
++        !sr_cd_rel_is_acceptable(name+base)) return SR_CD_INVALID_PATH;
++    struct stat info;
++    if (stat(name,&info)) return sr_fat_errno();
++    if (!S_ISDIR(info.st_mode)) return SR_CD_NOT_A_DIRECTORY;
++    memcpy(root->prefix,name,strlen(name)+1);
++    return SR_CD_OK;
++}
++static inline void sr_cd_root_close(sr_cd_root *root) { if (root) root->prefix[0]=0; }
++
++static inline sr_cd_status sr_fat_path(const sr_cd_root *r,const char *rel,
++                                       const char *leaf,char out[SR_FAT_PATH_CAP]) {
++    if (!r || !r->prefix[0] || !rel || (*rel && !sr_cd_rel_is_acceptable(rel)) ||
++        (leaf && !sr_cd_name_is_acceptable(leaf,strlen(leaf)))) return SR_CD_INVALID_PATH;
++    int n=snprintf(out,SR_FAT_PATH_CAP,"%s%s%s%s%s", r->prefix,*rel?"/":"",rel,
++                   leaf?"/":"",leaf?leaf:"");
++    return n>=0 && n<SR_FAT_PATH_CAP ? SR_CD_OK : SR_CD_INVALID_PATH;
++}
++static inline sr_cd_status sr_fat_kind(const char *path,int directory) {
++    struct stat info;
++    if (stat(path,&info)) return sr_fat_errno();
++    if (directory) return S_ISDIR(info.st_mode) ? SR_CD_OK : SR_CD_NOT_A_DIRECTORY;
++    return S_ISREG(info.st_mode) ? SR_CD_OK : SR_CD_IS_DIRECTORY;
++}
++static inline sr_cd_status sr_cd_dir_is_contained(const sr_cd_root *r,const char *rel) {
++    char path[SR_FAT_PATH_CAP];
++    sr_cd_status st=sr_fat_path(r,rel,NULL,path);
++    return st==SR_CD_OK ? sr_fat_kind(path,1) : st;
++}
++static inline sr_cd_status sr_cd_mkdir_leaf(const sr_cd_root *r,const char *rel) {
++    char path[SR_FAT_PATH_CAP];
++    if (!rel || !*rel) return SR_CD_INVALID_PATH;
++    sr_cd_status st=sr_fat_path(r,rel,NULL,path);
++    if (st!=SR_CD_OK) return st;
++    return sr_fat_mkdir(path)==0 ? SR_CD_OK : sr_fat_errno();
++}
++static inline sr_cd_status sr_cd_mkdirs(const sr_cd_root *r,const char *rel) {
++    char path[SR_FAT_PATH_CAP];
++    if (!rel || !*rel) return SR_CD_INVALID_PATH;
++    sr_cd_status st=sr_fat_path(r,rel,NULL,path);
++    if (st!=SR_CD_OK) return st;
++    char *part=path+strlen(r->prefix)+1;
++    for (;;) {
++        char *slash=strchr(part,'/');
++        if (slash) *slash=0;
++        if (sr_fat_mkdir(path) && (errno!=EEXIST || (st=sr_fat_kind(path,1))!=SR_CD_OK))
++            return st!=SR_CD_OK ? st : sr_fat_errno();
++        if (!slash) return SR_CD_OK;
++        *slash='/'; part=slash+1;
++    }
++}
++
++static inline int sr_fat_previous_path(const char *dst,char prev[SR_FAT_PATH_CAP]) {
++    const char *name=strrchr(dst,'/');
++    if (!name || strlen(name+1)+sizeof(SR_FAT_PREVIOUS)>SR_CD_NAME_MAX) return 0;
++    int n=snprintf(prev,SR_FAT_PATH_CAP,"%s%s",dst,SR_FAT_PREVIOUS);
++    return n>=0 && n<SR_FAT_PATH_CAP;
++}
++/* A power cut between the two name changes leaves either an existing
++ * destination plus its previous version, or a previous version alone. */
++static inline sr_cd_status sr_fat_recover(const char *dst) {
++    char prev[SR_FAT_PATH_CAP];
++    if (!sr_fat_previous_path(dst,prev)) return SR_CD_OK;
++    sr_cd_status old=sr_fat_kind(prev,0);
++    if (old==SR_CD_NOT_FOUND) return SR_CD_OK;
++    if (old!=SR_CD_OK) return old;
++    sr_cd_status current=sr_fat_kind(dst,0);
++    if (current==SR_CD_OK) return unlink(prev)==0 ? SR_CD_OK : sr_fat_errno();
++    if (current!=SR_CD_NOT_FOUND) return current;
++    return rename(prev,dst)==0 ? SR_CD_OK : sr_fat_errno();
++}
++static inline sr_cd_status sr_cd_open_file(const sr_cd_root *r,const char *dir,
++                              const char *leaf,sr_cd_file_mode mode,FILE **out) {
++    if (!out) return SR_CD_INVALID_PATH;
++    *out=NULL;
++    if (!leaf) return SR_CD_INVALID_PATH;
++    char path[SR_FAT_PATH_CAP];
++    sr_cd_status st=sr_fat_path(r,dir,leaf,path);
++    if (st!=SR_CD_OK || (st=sr_fat_recover(path))!=SR_CD_OK) return st;
++    static const int flags[]={
++        O_RDONLY, O_WRONLY|O_CREAT|O_TRUNC, O_RDWR, O_RDWR|O_CREAT|O_TRUNC,
++        O_RDWR|O_CREAT|O_APPEND,O_RDWR|O_TRUNC,O_RDWR|O_APPEND,
++        O_RDWR|O_CREAT|O_EXCL,O_RDWR|O_CREAT|O_EXCL|O_APPEND
++    };
++    static const char *const modes[]={"rb","wb","r+b","w+b","a+b","w+b","a+b","w+b","a+b"};
++    if ((unsigned)mode>=sizeof(flags)/sizeof(flags[0])) return SR_CD_INVALID_PATH;
++    st=sr_fat_kind(path,0);
++    if (st!=SR_CD_OK && st!=SR_CD_NOT_FOUND) return st;
++    int fd=open(path,flags[mode]|O_BINARY,0666);
++    if(fd<0) return sr_fat_errno();
++    *out=fdopen(fd,modes[mode]);
++    if(!*out) { close(fd); return SR_CD_IO_ERROR; }
++    return SR_CD_OK;
++}
++static inline sr_cd_status sr_cd_delete_file(const sr_cd_root *r,const char *rel) {
++    char path[SR_FAT_PATH_CAP];
++    if (!rel || !*rel) return SR_CD_INVALID_PATH;
++    sr_cd_status st=sr_fat_path(r,rel,NULL,path);
++    if (st!=SR_CD_OK || (st=sr_fat_recover(path))!=SR_CD_OK ||
++        (st=sr_fat_kind(path,0))!=SR_CD_OK) return st;
++    return unlink(path)==0 ? SR_CD_OK : sr_fat_errno();
++}
++static inline sr_cd_status sr_cd_delete_leaf(const sr_cd_root *r,const char *dir,const char *name) {
++    if (!name || !dir || !sr_cd_name_is_acceptable(name,strlen(name))) return SR_CD_INVALID_PATH;
++    char rel[SR_CD_REL_MAX]; int n=snprintf(rel,sizeof(rel),"%s%s%s",dir,*dir?"/":"",name);
++    return n>=0 && (size_t)n<sizeof(rel) ? sr_cd_delete_file(r,rel) : SR_CD_INVALID_PATH;
++}
++static inline sr_cd_status sr_cd_remove_dir_empty(const sr_cd_root *r,const char *rel) {
++    char path[SR_FAT_PATH_CAP];
++    if (!rel || !*rel) return SR_CD_INVALID_PATH;
++    sr_cd_status st=sr_fat_path(r,rel,NULL,path);
++    if (st!=SR_CD_OK || (st=sr_fat_kind(path,1))!=SR_CD_OK) return st;
++    return rmdir(path)==0 ? SR_CD_OK : sr_fat_errno();
++}
++static inline sr_cd_status sr_cd_delete_dir_shallow(const sr_cd_root *r,const char *rel) {
++    char path[SR_FAT_PATH_CAP];
++    if (!rel || !*rel) return SR_CD_INVALID_PATH;
++    sr_cd_status st=sr_fat_path(r,rel,NULL,path);
++    if (st!=SR_CD_OK) return st;
++    for (;;) {
++        char leaf[SR_CD_NAME_MAX]="";
++        DIR *dir=opendir(path);
++        if (!dir) return sr_fat_errno();
++        for (;;) {
++            errno=0; struct dirent *e=readdir(dir);
++            if (!e) { if(errno) st=sr_fat_errno(); break; }
++            if (!strcmp(e->d_name,".") || !strcmp(e->d_name,"..")) continue;
++            if (!sr_cd_name_is_acceptable(e->d_name,strlen(e->d_name))) continue;
++            char child[SR_FAT_PATH_CAP];
++            st=sr_fat_path(r,rel,e->d_name,child);
++            if(st!=SR_CD_OK) break;
++            st=sr_fat_kind(child,0);
++            if(st==SR_CD_IS_DIRECTORY) { st=SR_CD_OK; continue; }
++            if(st==SR_CD_OK) memcpy(leaf,e->d_name,strlen(e->d_name)+1);
++            break;
++        }
++        if(closedir(dir) && st==SR_CD_OK) st=SR_CD_IO_ERROR;
++        if(st!=SR_CD_OK) return st;
++        if(!*leaf) return sr_cd_remove_dir_empty(r,rel);
++        st=sr_cd_delete_leaf(r,rel,leaf);
++        if(st!=SR_CD_OK) return st;
++    }
++}
++static inline sr_cd_status sr_cd_rename_file_ex(const sr_cd_root *r,const char *src_rel,
++                                                const char *dst_rel,int replace) {
++    if(!src_rel || !*src_rel || !dst_rel || !*dst_rel) return SR_CD_INVALID_PATH;
++    char src[SR_FAT_PATH_CAP],dst[SR_FAT_PATH_CAP],prev[SR_FAT_PATH_CAP];
++    sr_cd_status st=sr_fat_path(r,src_rel,NULL,src);
++    if(st!=SR_CD_OK || (st=sr_fat_path(r,dst_rel,NULL,dst))!=SR_CD_OK ||
++       (st=sr_fat_recover(src))!=SR_CD_OK || (st=sr_fat_kind(src,0))!=SR_CD_OK ||
++       (st=sr_fat_recover(dst))!=SR_CD_OK) return st;
++    if(strlen(src)==strlen(dst) && !sr_vfs_strnicmp(src,dst,strlen(src)))
++        return replace ? SR_CD_OK : SR_CD_ALREADY_EXISTS;
++    st=sr_fat_kind(dst,0);
++    if(st==SR_CD_NOT_FOUND) return rename(src,dst)==0 ? SR_CD_OK : sr_fat_errno();
++    if(st!=SR_CD_OK || !replace) return st==SR_CD_OK ? SR_CD_ALREADY_EXISTS : st;
++    if(!sr_fat_previous_path(dst,prev)) return SR_CD_INVALID_PATH;
++    if(rename(dst,prev)) return sr_fat_errno();
++    if(rename(src,dst)) {
++        sr_cd_status failure=sr_fat_errno();
++        if(rename(prev,dst)) return SR_CD_IO_ERROR;
++        return failure;
++    }
++    return unlink(prev)==0 ? SR_CD_OK : sr_fat_errno();
++}
++static inline sr_cd_status sr_cd_rename_file(const sr_cd_root *r,const char *src,const char *dst) {
++    return sr_cd_rename_file_ex(r,src,dst,1);
++}
++static inline sr_cd_status sr_cd_set_mode(const sr_cd_root *r,const char *rel,uint32_t mode) {
++    (void)mode;
++    char path[SR_FAT_PATH_CAP];
++    sr_cd_status st=sr_fat_path(r,rel,NULL,path);
++    return st==SR_CD_OK ? SR_CD_UNSUPPORTED_HOST : st; /* FAT has no Unix permission bits. */
++}
++static inline sr_cd_status sr_cd_sync_dir(const sr_cd_root *r,const char *rel) {
++    sr_cd_status st=sr_cd_dir_is_contained(r,rel);
++    if(st!=SR_CD_OK) return st;
++#if defined(SR_CD_FAT_TEST)
++    return SR_CD_OK;
++#else
++    return nx_sdmc_commit() ? SR_CD_OK : SR_CD_IO_ERROR;
++#endif
++}
++static inline sr_cd_status sr_cd_lock_dir(const sr_cd_root *r,const char *rel,int *fd_out) {
++    if (!fd_out) return SR_CD_INVALID_PATH;
++    *fd_out=-1;
++    char path[SR_FAT_PATH_CAP];
++    sr_cd_status st=sr_fat_path(r,rel,".nakagawa-savedata-lock",path);
++    if(st!=SR_CD_OK) return st;
++    /* Horizon keeps open write handles exclusive. Keep the lock file permanently;
++     * release is closing the handle, including process exit after a crash. */
++    int fd=open(path,O_RDWR|O_CREAT|O_BINARY,0666);
++    if(fd<0) return sr_fat_errno();
++    *fd_out=fd;
++    return SR_CD_OK;
++}
++static inline void sr_cd_unlock_dir(int fd) { if(fd>=0) close(fd); }
++#endif
++
+--- a/src/rt/videorec.c
++++ b/src/rt/videorec.c
+@@ -543,41 +543,7 @@
+ }
+ #else
+ static int vr_proc_start(VrProc *p, const char *exe, const char *const *argv, int with_stdin) {
+-    memset(p, 0, sizeof *p);
+-    p->in = -1;
+-    int fds[2] = { -1, -1 };
+-    if (with_stdin && pipe(fds) != 0) return 0;
+-    /* posix_spawn, not fork: the runtime has many threads, and the child must run no
+-     * runtime code between fork and exec. The encoder reads frames on stdin and writes its
+-     * console output to the runtime's stderr. A program that cannot start fails here. */
+-    posix_spawn_file_actions_t fa;
+-    if (posix_spawn_file_actions_init(&fa) != 0) {
+-        if (with_stdin) { close(fds[0]); close(fds[1]); }
+-        return 0;
+-    }
+-    int ok = 1;
+-    if (with_stdin) {
+-        ok = posix_spawn_file_actions_adddup2(&fa, fds[0], 0) == 0 &&
+-             posix_spawn_file_actions_addclose(&fa, fds[0]) == 0 &&
+-             posix_spawn_file_actions_addclose(&fa, fds[1]) == 0;
+-    }
+-    ok = ok && posix_spawn_file_actions_adddup2(&fa, 2, 1) == 0;
+-    pid_t pid = -1;
+-    if (ok) ok = posix_spawn(&pid, exe, &fa, NULL, (char *const *)argv, environ) == 0;
+-    posix_spawn_file_actions_destroy(&fa);
+-    if (!ok) {
+-        if (with_stdin) { close(fds[0]); close(fds[1]); }
+-        return 0;
+-    }
+-    if (with_stdin) {
+-        close(fds[0]);
+-        p->in = fds[1];
+-        /* A dead encoder must surface as a failed write, not end the runtime. */
+-        signal(SIGPIPE, SIG_IGN);
+-    }
+-    p->pid = pid;
+-    p->running = 1;
+-    return 1;
++    (void)p; (void)exe; (void)argv; (void)with_stdin; return 0;
+ }
+ 
+ static int vr_proc_write(VrProc *p, const void *buf, size_t len) {
+@@ -593,15 +559,7 @@
+ }
+ 
+ static int vr_proc_finish(VrProc *p) {
+-    if (!p->running) return -1;
+-    if (p->in >= 0) close(p->in);
+-    p->in = -1;
+-    int status = 0;
+-    pid_t r;
+-    do { r = waitpid(p->pid, &status, 0); } while (r < 0 && errno == EINTR);
+-    p->running = 0;
+-    if (r < 0 || !WIFEXITED(status)) return -1;
+-    return WEXITSTATUS(status);
++    (void)p; return -1;
+ }
+ #endif
+ 
