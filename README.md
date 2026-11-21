@@ -1,3 +1,14 @@
+## Play on Nintendo Switch
+
+[Download Persona Switch Builder for Windows x64](https://github.com/Sezero75/persona-psp-switch-port/releases/latest)
+
+1. Extract the ZIP and open `Persona Switch Builder.exe`.
+2. Drop in your own matching Persona PSP US Undub ISO (ULUS10432 v1.00).
+3. Choose an output folder. When the build finishes, copy the `switch` folder
+   inside `Persona Switch SD` to the root of your SD card.
+
+The first build downloads about 107 MiB of compiler tools. Your ISO stays on your PC.
+
 # Persona PSP for Nintendo Switch
 
 An unofficial native Switch homebrew port of the US PSP version of *Shin Megami Tensei: Persona*. The build translates the PSP game's MIPS code to C ahead of time, compiles it for ARM64, and links it with Nakagawa Recomp's PSP runtime and a Switch backend. The runtime also has an interpreter fallback.
